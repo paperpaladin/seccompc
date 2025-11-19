@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
+#include <limits.h>
 #include <linux/seccomp.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -59,6 +60,9 @@
 #endif
 #ifndef SECCOMP_RET_ALLOW
 #define SECCOMP_RET_ALLOW 0x7fff0000U
+#endif
+#ifndef SECCOMP_SET_MODE_FILTER
+#define SECCOMP_SET_MODE_FILTER 1
 #endif
 #ifndef SECCOMP_GET_ACTION_AVAIL
 #define SECCOMP_GET_ACTION_AVAIL 2
@@ -209,7 +213,8 @@ static const char *action_name(uint32_t ret) {
 	X(ftruncate) X(getdents) X(getdents64) X(getcwd) X(chdir) \
 	X(rename) X(mkdir) X(rmdir) X(creat) X(link) X(unlink) X(symlink) \
 	X(readlink) X(chmod) X(fchmod) X(chown) X(umask) X(gettimeofday) \
-	X(getrlimit) X(setrlimit) X(getrusage) X(getuid) X(getgid) \
+	X(getrlimit) X(setrlimit) X(getrusage) X(sysinfo) X(times) \
+	X(statfs) X(fstatfs) X(tgkill) X(getuid) X(getgid) \
 	X(setuid) X(setgid) X(geteuid) X(getegid) X(getppid) X(setsid) \
 	X(sched_setaffinity) X(sched_getaffinity) X(ptrace) X(capget) \
 	X(capset) X(sigaltstack) X(prctl) X(arch_prctl) X(chroot) \
@@ -829,6 +834,112 @@ static struct sock_filter *read_filter(const char *path, int *out_n) {
 	return f;
 }
 
+/* ------------------------------------------------------------- install --- */
+
+/*
+ * CMD can only run if the policy allows execve, and that is structural rather
+ * than an oversight: the filter has to be in place before the exec that
+ * launches CMD, because there is no way to install a filter on a process you
+ * are not. systemd's SystemCallFilter has the same property and papers over it
+ * by adding execve silently. Refusing instead, because a policy that reads
+ * differently from the policy enforced is the thing this tool exists to avoid.
+ *
+ * The consequence is a real limitation and is in the README: seccompc cannot
+ * deny execve to CMD, only to CMD's children... and not even that, since the
+ * domain is one filter shared by the whole tree.
+ */
+static void require_execve(void) {
+	uint32_t act = def_act;
+	for (int i = 0; i < nrule; i++)
+		if (rules[i].nr == __NR_execve) act = rules[i].act;
+	act &= SECCOMP_RET_ACTION_FULL;
+	if (act != SECCOMP_RET_ALLOW && act != SECCOMP_RET_LOG)
+		die("this policy gives execve the action '%s', so CMD could "
+		    "never start -- the filter is installed before the exec "
+		    "that launches it. Put execve in an allow= clause.",
+		    action_name(act));
+}
+
+/*
+ * Resolve CMD the way execvp will, BEFORE the filter goes in.
+ *
+ * Not politeness: after the filter is installed, a failed exec cannot be
+ * reported. Printing the message needs write(), which the policy may deny, and
+ * under default=kill the attempt to complain is itself fatal -- so the caller
+ * would see 159 and no message where the contract promises 127. Checking first
+ * is the only way the 125/126/127 split means anything.
+ *
+ * shortcut: this is access(X_OK), so a file unlinked or chmod'ed between the
+ * check and the exec still lands in the unreportable case. The upgrade path is
+ * to open the resolved path O_PATH|O_CLOEXEC here and execveat() it, which
+ * closes the race by holding the inode rather than the name.
+ */
+static void preflight(const char *cmd) {
+	const char *path, *p;
+	char buf[PATH_MAX];
+
+	if (strchr(cmd, '/')) {
+		if (access(cmd, X_OK) == 0) return;
+		fprintf(stderr, "%s: %s: %s\n", prog, cmd, strerror(errno));
+		exit(errno == ENOENT ? 127 : 126);
+	}
+	path = getenv("PATH");
+	if (!path) path = "/usr/bin:/bin";
+	for (p = path; *p;) {
+		const char *colon = strchr(p, ':');
+		size_t len = colon ? (size_t)(colon - p) : strlen(p);
+		/* An empty PATH element means the current directory; execvp
+		 * does the same, and a policy audit should not differ from
+		 * the exec it is predicting. */
+		int n = len ? snprintf(buf, sizeof buf, "%.*s/%s", (int)len, p, cmd)
+		            : snprintf(buf, sizeof buf, "./%s", cmd);
+		if (n > 0 && n < (int)sizeof buf && access(buf, X_OK) == 0)
+			return;
+		if (!colon) break;
+		p = colon + 1;
+	}
+	fprintf(stderr, "%s: %s: not found in PATH\n", prog, cmd);
+	exit(127);
+}
+
+static void install(struct sock_filter *f, int n) {
+	struct sock_fprog fprog;
+	fprog.len = (unsigned short)n;
+	fprog.filter = f;
+
+	/*
+	 * PR_SET_NO_NEW_PRIVS first, and the ordering is the kernel's demand
+	 * rather than a preference: without it SECCOMP_SET_MODE_FILTER returns
+	 * EACCES unless the caller holds CAP_SYS_ADMIN, which is exactly what
+	 * we are avoiding.
+	 *
+	 * The reason the kernel insists is the same reason Landlock does. A
+	 * filtered process that could exec a setuid-root binary would be
+	 * handed privileges while a filter it did not choose was still in
+	 * force, and the privileged program would then behave in ways its
+	 * author never considered -- a syscall it has always been able to make
+	 * suddenly returning EPERM. Seccomp's claim is "an unprivileged
+	 * process may safely restrict itself", and that only holds if it
+	 * cannot gain privileges afterwards. no_new_privs is one-way and
+	 * inherited, matching the filter.
+	 */
+	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
+		die("prctl(PR_SET_NO_NEW_PRIVS): %s", strerror(errno));
+
+	/*
+	 * The seccomp() syscall in preference to prctl(PR_SET_SECCOMP): same
+	 * effect, but it is the interface that takes flags, and prctl is the
+	 * 2.6.23-era spelling kept for compatibility. Falling back to prctl
+	 * only on ENOSYS, which means a kernel between 2.6.23 and 3.17.
+	 */
+	if (syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &fprog) == 0)
+		return;
+	if (errno != ENOSYS)
+		die("seccomp(SET_MODE_FILTER): %s", strerror(errno));
+	if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &fprog, 0, 0) < 0)
+		die("prctl(PR_SET_SECCOMP): %s", strerror(errno));
+}
+
 int main(int argc, char **argv) {
 	if (argv[0]) prog = argv[0];
 
@@ -848,6 +959,30 @@ int main(int argc, char **argv) {
 		write_filter(argv[4], f, n);
 		free(f);
 		return 0;
+	}
+
+	if (argc >= 2 && !strcmp(argv[1], "-a")) {
+		struct sock_filter *f;
+		int n;
+		if (argc < 5 || strcmp(argv[3], "--"))
+			die("usage: %s -a POLICY -- CMD [ARGS...]", prog);
+		parse_policy(argv[2]);
+		require_execve();
+		preflight(argv[4]);
+		f = emit(&n);
+		install(f, n);
+		/*
+		 * exec, not fork+wait: CMD *is* this process from here on, so
+		 * its exit status, its death by signal and all three standard
+		 * streams are its own by construction rather than forwarded by
+		 * code of ours that could be a bug. The filter survives exec --
+		 * that is the whole mechanism -- and seccompc is not in the
+		 * loop afterwards.
+		 */
+		execvp(argv[4], &argv[4]);
+		fprintf(stderr, "%s: exec %s: %s\n", prog, argv[4],
+		    strerror(errno));
+		return errno == ENOENT ? 127 : 126;
 	}
 
 	if (argc >= 2 && !strcmp(argv[1], "-d")) {
