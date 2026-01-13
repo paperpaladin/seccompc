@@ -380,6 +380,8 @@ checkorder() {
 	    print "insn 0 is [" $2 " " $3 "], not a load of seccomp_data.arch"; exit }
 	  NR == 2 && ($2 != "jeq" || $3 != "#0xc000003e") {
 	    print "insn 1 does not compare against AUDIT_ARCH_X86_64"; exit }
+	  NR == 2 && ($5 != "0003" || $7 != "0002") {
+	    print "insn 1 branches to " $5 "/" $7 ", so a mismatch does not reach the kill at 0002"; exit }
 	  NR == 3 && ($2 != "ret" || $3 != "#0x80000000") {
 	    print "an arch mismatch does not return KILL_PROCESS"; exit }
 	  $3 == "[0]" && !nrld { nrld = NR }
@@ -418,7 +420,14 @@ cmp -s "$TD/r1.bpf" "$TD/r2.bpf" && ok 'the same policy compiles to the same byt
 # -d reads bytes someone else wrote. Each of these exits 125 with a message on
 # stderr, and under test-asan each of them also has to not read out of bounds.
 printf '' > "$TD/m-empty.bpf"
-head -c 12 "$TD/r1.bpf" > "$TD/m-trunc.bpf"
+# A COMPLETE, valid program plus four stray bytes. The first version of this
+# fixture was the first 12 bytes of a valid filter, and it survived deleting the
+# size check entirely: 12/8 truncates to one instruction, that instruction is a
+# load rather than a return, and the file was still refused -- for the wrong
+# reason. Here the only thing wrong is the size, so removing the check makes the
+# file acceptable and the assertion goes red.
+cat "$TD/r1.bpf" > "$TD/m-trunc.bpf"
+head -c 4 /dev/zero >> "$TD/m-trunc.bpf"
 head -c 1  "$TD/r1.bpf" > "$TD/m-byte.bpf"
 # 4097 instructions' worth of bytes, one past BPF_MAXINSNS. The content does
 # not matter: the length is checked before anything is decoded, which is the
@@ -427,8 +436,11 @@ head -c 32776 /dev/zero > "$TD/m-long.bpf"
 # jeq k=41 with jt=80, in a two-instruction program: a jump past the end.
 printf '\025\000\120\000\051\000\000\000\006\000\000\000\000\000\377\177' \
 	> "$TD/m-jump.bpf"
-# ends with a comparison rather than a return
-printf '\040\000\000\000\004\000\000\000\025\000\000\000\001\000\000\000' > "$TD/m-noret.bpf"
+# Two loads and nothing else: falls off the end with no verdict. Written as two
+# loads rather than ending on a comparison, because a comparison is also a jump
+# past the end and the fixture would then have two faults -- which is how the
+# first version of it survived deleting the terminating-return check.
+printf '\040\000\000\000\004\000\000\000\040\000\000\000\000\000\000\000' > "$TD/m-noret.bpf"
 # opcode 0x00ff is not a classic-BPF instruction
 printf '\377\000\000\000\000\000\000\000\006\000\000\000\000\000\377\177' > "$TD/m-op.bpf"
 # absolute load at offset 9999, far outside seccomp_data
@@ -507,6 +519,14 @@ t 'exec of a non-PATH name is 127'     127 -- "$SC" \
     -a "default=allow" -- zzz-not-a-command
 t 'exec of a non-executable is 126'    126 -- "$SC" \
     -a "default=allow" -- "$TD/r1.bpf"
+# The same two, under a policy that denies write. These are the assertions the
+# PATH preflight exists for: without it the exec fails, seccompc tries to say
+# so, the write is killed, and the caller sees 159 instead of 127. With
+# default=allow above, write is permitted and the wrong order is invisible.
+t 'missing command is 127 even under default=kill' 127 -- "$SC" \
+    -a "default=kill; allow=execve" -- /nonexistent-bbbb
+t 'non-executable is 126 even under default=kill'  126 -- "$SC" \
+    -a "default=kill; allow=execve" -- "$TD/r1.bpf"
 # A decimal syscall number is accepted where a name would be, which is the
 # escape hatch for anything outside the name table. 102 is getuid.
 t 'a decimal syscall number works'       0 -- $TO "$SC" \
@@ -519,6 +539,36 @@ t 'and the same number can be denied'   38 -- $TO "$SC" \
 t 'whitespace and a trailing ; are fine'  0 -- $TO "$SC" \
     -a " default = errno:ENOSYS ; allow = execve , write , exit_group , getuid ; " \
     -- "$TRY" call getuid
+
+# ===========================================================================
+# 14. an action this kernel does not implement is refused, not installed
+# ===========================================================================
+# The kernel does NOT reject a filter returning an action it does not know: it
+# treats the value as the lowest action it recognises, KILL_THREAD. So a policy
+# asking for kill_process on a 4.13 kernel would install and do something else.
+# Every action exists on this kernel, so SECCOMPC_NO_ACTION drives the refusal
+# the way jail's JAIL_ABI_MAX drives its degradation -- downward only.
+for a in kill_process kill_thread trap errno log allow; do
+	case $a in
+	kill_process) pol='default=kill' ;;
+	kill_thread)  pol='default=kill_thread' ;;
+	trap)         pol='default=kill; trap=read' ;;
+	errno)        pol='default=kill; errno=EPERM:read' ;;
+	log)          pol='default=kill; log=read' ;;
+	allow)        pol='default=kill; allow=read' ;;
+	esac
+	# Without the clamp it compiles; with it, it is refused. The pair is what
+	# shows the refusal is about availability and not about the policy.
+	t "control: $a compiles when available"  0 -- "$SC" -c "$pol" -o "$TD/z"
+	t "a missing $a action is refused"     125 -- env "SECCOMPC_NO_ACTION=$a" \
+	    "$SC" -c "$pol" -o "$TD/z"
+done
+# And --actions tells the same story, so the clamp is one answer rather than two.
+_o=$(SECCOMPC_NO_ACTION=trap "$SC" --actions)
+case " $_o " in
+*" trap "*) bad '--actions honours the clamp' "trap still listed: $_o" ;;
+*)          ok '--actions honours the clamp' ;;
+esac
 
 printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"
 [ "$fail" -eq 0 ]
