@@ -362,6 +362,43 @@ tout 'denying chmod alone does NOT stop chmod(1)' 0 'rc=0' -- \
     "chmod 700 $TD 2>/dev/null; echo rc=\$?"
 
 # ===========================================================================
+# 10b. the errno chosen is part of the policy's meaning, not cosmetic
+# ===========================================================================
+# ENOSYS is the errno libc fallback paths look for. glibc probes a newer
+# syscall and retries an older one when it gets ENOSYS back -- statx then
+# newfstatat, clone3 then clone, faccessat2 then faccessat -- so denying a
+# syscall with ENOSYS can leave the operation working through another door
+# while the policy reads like a denial. Driven here rather than asserted:
+# the same policy shape, one word different, opposite outcomes.
+# stat(1) is invoked by its absolute path on purpose. Through PATH the third
+# assertion came back 127 instead: dash resolves a command name with
+# newfstatat, so denying that syscall stopped the shell finding stat(1) at all
+# and the test was measuring the shell rather than the policy. That collateral
+# shape is real and is in the README; it is not what these three lines are
+# about.
+STATBIN=$(command -v stat 2>/dev/null || echo /nonexistent)
+if [ -x "$STATBIN" ] && command -v strace >/dev/null 2>&1 &&
+   strace -f -o "$TD/sx" "$STATBIN" -c %s "$TD" >/dev/null 2>&1 &&
+   grep -q 'statx(' "$TD/sx"; then
+	tout 'EPERM on statx stops stat(1)'            0 'rc=1' -- \
+	    $TO "$SC" -a 'default=allow; errno=EPERM:statx' -- /bin/sh -c \
+	    "$STATBIN -c %s $TD >/dev/null 2>&1; echo rc=\$?"
+	tout 'ENOSYS on statx does not: glibc falls back' 0 'rc=0' -- \
+	    $TO "$SC" -a 'default=allow; errno=ENOSYS:statx' -- /bin/sh -c \
+	    "$STATBIN -c %s $TD >/dev/null 2>&1; echo rc=\$?"
+	# ... and naming both doors closes it, which is the usable lesson.
+	tout 'naming statx and newfstatat closes it'   0 'rc=1' -- \
+	    $TO "$SC" -a 'default=allow; errno=ENOSYS:statx,newfstatat' -- \
+	    /bin/sh -c "$STATBIN -c %s $TD >/dev/null 2>&1; echo rc=\$?"
+else
+	for n in 'EPERM on statx stops stat(1)' \
+	         'ENOSYS on statx does not: glibc falls back' \
+	         'naming statx and newfstatat closes it'; do
+		skipt "$n" 'stat(1) here does not use statx, or no strace'
+	done
+fi
+
+# ===========================================================================
 # 11. the emitted filter has the arch check before the nr comparison
 # ===========================================================================
 # WEAKEST ORACLE IN THIS FILE. Both the emitter and the disassembler are ours,
