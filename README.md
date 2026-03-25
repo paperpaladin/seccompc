@@ -404,7 +404,8 @@ of the same shape -- **a fixture that was being refused for the wrong reason**:
 
 ### What does not work
 
-Honestly, and this list is longer than the one above.
+Honestly, and this list is longer than the one above. Twenty-one entries,
+every one either measured here or named as untested.
 
 - **`execve` cannot be denied to CMD.** The filter must be installed before the
   exec that starts CMD, because a process cannot install a filter on a process
@@ -482,7 +483,7 @@ Honestly, and this list is longer than the one above.
   through real syscalls. It does not prove the behaviour of a 4.13 kernel,
   which nothing short of a 4.13 kernel can. Same honesty gap as jail's
   `JAIL_ABI_MAX`, and named the same way.
-- **The syscall and errno name tables are curated**, around 170 and 30 entries.
+- **The syscall and errno name tables are curated**, 177 and 30 entries.
   A decimal number works anywhere a name does, so nothing is inexpressible --
   but `unknown syscall name: foo` for a real syscall is a bad error message.
   Generating the list from `<asm/unistd_64.h>` costs one generated file.
