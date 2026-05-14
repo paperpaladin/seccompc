@@ -355,10 +355,10 @@ kernel and answering "yes" are the same function here. Only a kernel missing an
 action could tell them apart, and `SECCOMPC_NO_ACTION` drives the surrounding
 logic instead.
 
-Three mutations are caught only by the structural check, which is the
-weakest oracle in the suite, and all three are observationally identical to a
+Three mutations are caught only by the structural check, the weakest
+oracle in the suite, and all three are observationally identical to a
 single-threaded probe making real syscalls: `jgt` -> `jge` differs only at
-`nr == 0x3fffffff`, which is not a syscall; `KILL_THREAD` and `KILL_PROCESS`
+`nr == 0x3fffffff`, a number that is no syscall; `KILL_THREAD` and `KILL_PROCESS`
 are the same death for a process with one thread, and swapped `jt`/`jf` in the
 disassembler changes no filter. The structural check earning its place on those
 three is the argument for keeping it, and the reason it is still ranked last.
@@ -410,7 +410,7 @@ every one either measured here or named as untested.
   it is not. So the policy has to permit `execve`, and since the filter is one
   domain shared by the whole tree, CMD and all its children can exec too.
   seccompc refuses a policy that denies `execve` instead of adding it
-  silently, which is what systemd's `SystemCallFilter` does. The honest fix is
+  silently, as systemd's `SystemCallFilter` does. The honest fix is
   a trampoline, permit exec only from a specific `instruction_pointer`, or
   `SECCOMP_RET_TRACE` with a supervisor allowing exactly one, and both are
   larger than this program.
@@ -453,8 +453,8 @@ every one either measured here or named as untested.
   kill. The transparency claim is scoped to syscalls the policy can name.
 - `-a` cannot install a filter from a file. `-c` output is for inspection,
   diffing and feeding to some other program; `-a` recompiles from the policy.
-  So `-c` plus `-d` is a loop that never reaches the kernel, which is exactly
-  why the round trip is ranked last as an oracle.
+  So `-c` plus `-d` is a loop that never reaches the kernel. That is exactly
+  why the round trip ranks last as an oracle.
 - The `-d` validator has no external authority. It is ours, and it is not
   checked against the kernel's `bpf_check_classic()`. A filter we accept and
   the kernel refuses shows up only indirectly, as an install failure on a
@@ -465,7 +465,7 @@ every one either measured here or named as untested.
   load outside the 64 bytes of `seccomp_data`, because the kernel does, so it
   is useless for socket filters.
 - x32 is driven by reconstruction, not by an x32 binary. The 64-bit probe
-  sets bit 30 in `rax`, which is what seccomp sees either way, so the assertion
+  sets bit 30 in `rax`, and seccomp sees that either way, so the assertion
   is sound, but it is not the x32 entry path itself. That needs
   `CONFIG_X86_X32_ABI` and an x32 toolchain.
 - `kill_process` and `kill_thread` are not distinguished. They differ only
@@ -494,7 +494,7 @@ every one either measured here or named as untested.
   sees 159 with no message. `execveat()` on an `O_PATH` descriptor would close
   it.
 - No `SECCOMP_RET_USER_NOTIF` and no `SECCOMP_RET_TRACE`. Both need a
-  supervisor process, which is a different program.
+  supervisor process, a different program.
 - No `SECCOMP_FILTER_FLAG_TSYNC`. Irrelevant to `-a`, which installs before
   any thread exists. Essential the moment this is used as a library.
 - A killed process dumps core by default. seccompc does not change
@@ -525,7 +525,7 @@ The arch check first. Covered above. It is the reason the program exists.
 
 `no_new_privs` before the filter. Not an ordering preference:
 `SECCOMP_SET_MODE_FILTER` returns `EACCES` without it unless you hold
-`CAP_SYS_ADMIN`, which is what we are avoiding. The reason the kernel insists:
+`CAP_SYS_ADMIN`, the very thing being avoided. The reason the kernel insists:
 a filtered process that could exec a setuid-root binary would be handed
 privileges while a filter it did not choose was still in force, and that
 privileged program would meet `EPERM` on a syscall it has always been able to
