@@ -302,7 +302,7 @@ Ranked by how little we control them:
 The escape transcript is the interesting one. Clearing `no_new_privs` is
 `EINVAL`. It is one-way. `PR_SET_SECCOMP` with `SECCOMP_MODE_DISABLED` is
 `EINVAL`. There is no way to turn a filter off. And installing a maximally
-permissive filter of its own succeeds, and changes nothing: filters do not
+permissive filter of its own succeeds, and changes nothing. Filters do not
 replace each other, they accumulate. Every filter in the task's list runs on
 every syscall and the most restrictive answer wins. There is no
 `seccomp_release()`, by design. The policy for that test deliberately allows
@@ -489,7 +489,7 @@ every one either measured here or named as untested.
   is not expressible. It is a real technique. It is also a way to make a policy
   lie to the program it is confining by accident.
 - The PATH preflight is `access(X_OK)`, so a command unlinked between the
-  check and the exec still lands in the case the preflight exists to avoid: the
+  check and the exec still lands in the case the preflight exists to avoid. The
   exec fails, seccompc tries to say so, the `write` is denied, and the caller
   sees 159 with no message. `execveat()` on an `O_PATH` descriptor would close
   it.
