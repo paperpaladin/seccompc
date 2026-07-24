@@ -370,7 +370,7 @@ of the same shape, a fixture that was being refused for the wrong reason:
   Delete the size check and 12/8 truncates to one instruction, that instruction
   is a load, not a return, and the file is still refused, by a
   different check. The fixture is now a complete program plus four stray bytes.
-  The sanitizer run caught that mutation anyway, by a route nobody designed:
+  A sanitizer run caught that mutation anyway, by a route nobody designed:
   with the check gone a one-byte file yields zero instructions and the
   terminating-return check reads `f[-1]`.
 - `reject: no terminating return` ended its program on a comparison, which is
@@ -424,7 +424,7 @@ every one either measured here or named as untested.
   ```
 
   The second is glibc falling back to `newfstatat`, which strace shows
-  directly. The same applies to `clone3` -> `clone` and `faccessat2` ->
+  directly. That applies equally to `clone3` -> `clone` and `faccessat2` ->
   `faccessat`. Naming every door closes it. There is no way for seccompc to
   know what the doors are.
 - Collateral damage is normal and lands far from the syscall named.
