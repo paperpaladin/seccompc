@@ -438,7 +438,7 @@ every one either measured here or named as untested.
   names, and userspace can change that memory after the check and before the
   kernel reads it. Offering `arg0==N` would invite exactly that race, so the
   answer is no.
-- A policy names syscalls, not libc functions, and the two diverge.
+- A policy names syscalls. What libc calls a function is a different vocabulary, and the two diverge.
   `chmod(1)` does not use the `chmod(2)` syscall; glibc routes it through
   `fchmodat(2)`, so `errno=EPERM:chmod` changes nothing. The suite asserts
   that, with the reason, because it is the most likely way for a real policy to
@@ -448,7 +448,7 @@ every one either measured here or named as untested.
   everything else arrives at a kill. A legitimately 32-bit child process dies
   of `SIGSYS` under any policy, including `default=allow`. That is the safe
   direction and still a surprise.
-- Out-of-range syscall numbers are killed, not passed through.
+- Out-of-range syscall numbers are killed outright.
   `syscall(-1)` normally returns `ENOSYS`. Under any seccompc filter it is a
   kill. The transparency claim is scoped to syscalls the policy can name.
 - `-a` cannot install a filter from a file. `-c` output is for inspection,
@@ -464,7 +464,7 @@ every one either measured here or named as untested.
 - `-d` is a seccomp disassembler, not a BPF one. It refuses an absolute
   load outside the 64 bytes of `seccomp_data`, because the kernel does, so it
   is useless for socket filters.
-- x32 is driven by reconstruction, not by an x32 binary. The 64-bit probe
+- x32 is driven by reconstruction, with no x32 binary involved. The 64-bit probe
   sets bit 30 in `rax`, and seccomp sees that either way, so the assertion
   is sound, but it is not the x32 entry path itself. That needs
   `CONFIG_X86_X32_ABI` and an x32 toolchain.
@@ -503,8 +503,7 @@ every one either measured here or named as untested.
   whatever your `core_pattern` points at.
 - This is not a sandbox on its own. seccomp gates syscalls, not paths: a
   process permitted `openat` can open anything the filesystem permissions
-  allow. The sibling repo `jail` is the filesystem half, and the two
-  compose, not substitute.
+  allow. The sibling repo `jail` is the filesystem half, and the two compose, and neither substitutes for the other.
 
 ## Design
 
