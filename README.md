@@ -296,7 +296,7 @@ Ranked by how little we control them:
     ok    a missing allow action is refused
     ok    --actions honours the clamp
     
-    125 passed, 0 failed, 1 skipped
+    130 passed, 0 failed, 1 skipped
 ```
 
 The escape transcript is the interesting one. Clearing `no_new_privs` is
@@ -399,6 +399,51 @@ of the same shape, a fixture that was being refused for the wrong reason:
 - `-c` / `-d` round trip, with a validator that refuses what the kernel would
   refuse.
 - A decimal syscall number works anywhere a name does.
+
+## The validator, and the authority it did not have
+
+`seccompc -d FILE` disassembles a filter and refuses one the kernel
+would not accept. That refusal was the only claim in this program
+with nothing behind it: every other behaviour is checked by being
+run, and the validator only ever saw filters this program had just
+emitted. A filter it accepted and the kernel refused turned up
+indirectly as a failed install. A filter it **refused** that the
+kernel would have accepted was invisible.
+
+`seccompc --probe FILE` asks the kernel. The suite sweeps 11 filters
+through both, 6 the kernel accepts and 5 it refuses, and requires
+them to agree on every one. Both counts are asserted: a corpus where
+everything was valid would agree perfectly while saying nothing about
+the refusal half, which is the half that was missing.
+
+### The channel cannot be a syscall the filter might forbid
+
+The plan item said a fork was needed because a successful install may
+deny the write that reports it. That was right, and worse than it
+sounded.
+
+The first version carried the answer out in the child's exit status.
+Two of the five filters this program emits killed it: a default of
+`kill` denies `exit_group`, so a child that installed the filter
+**successfully** died of `SIGSYS` at the moment it tried to say so.
+Both were reported as skips, and the sweep still said "agrees on
+all", with a quietly smaller number inside it.
+
+The answer travels on a pipe written **before** the filter exists,
+which is the only moment every syscall is certainly available. Data
+on the pipe means refused; silence means accepted. So a `SIGSYS`
+death after the `seccomp` call is evidence of success, which reads
+backwards until you notice that a filter has to exist before it can
+kill anything.
+
+The sweep asserts that no filter went unanswered, so a skip cannot
+hide inside a pass. That assertion is what catches the mutation
+removing the `SIGSYS` case; without it, two filters silently stop
+being compared and everything stays green.
+
+`SECCOMPC_PROBE_LIE=1` makes the validator accept everything, so the
+comparison can be shown to notice a validator that is wrong. Three
+mutations, all caught.
 
 ## What does not work
 
