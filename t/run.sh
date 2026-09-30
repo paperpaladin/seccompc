@@ -187,10 +187,42 @@ else
 skipt 'kill_thread= clause: SIGSYS' "kernel has no kill_thread action"
 fi
 # kill_process and kill_thread differ only in how much of a multi-threaded
-# process they take down. The probe has one thread, so this suite cannot tell
-# them apart, and says so rather than inventing an assertion.
-skipt 'kill_process differs from kill_thread' \
-      'the probe is single-threaded, so both are the same death'
+# process they take down, and the probe had one thread, so this was the one
+# skip in the suite. `try thread` clones a sibling with CLONE_THREAD and
+# CLONE_CHILD_CLEARTID and lets the SIBLING make the denied call, which turns
+# the kernel's choice between do_exit(SIGSYS) and do_group_exit(SIGSYS) into
+# two outcomes visible from outside: 97, printed by a thread that outlived its
+# sibling, against 159 for the whole group.
+#
+# The three lines are one assertion. 159 alone is what a kill of any scope
+# produces; 97 alone would also appear if the filter had done nothing to the
+# sibling at all, which is what the control rules out by having the sibling's
+# call succeed and say so in its own words.
+#
+# clone and sched_yield are in the policy because the op needs them: the
+# sibling is created by one and the surviving thread waits with the other.
+# gettid is not needed and is left out, so nothing here passes because the
+# policy was broad.
+P_THR="allow=$BASE,sched_yield,clone"
+if has_action kill_thread && has_action kill_process; then
+	$TO "$SC" -a "default=kill; $P_THR,socket" -- \
+	    "$TRY" thread socket > "$TD/thr" 2>&1
+	grepped 'control: the sibling thread is what made the call' \
+	        'OK call-in-sibling socket' "$TD/thr"
+	t 'control: and the permitted call succeeded'    0 -- $TO "$SC" \
+	    -a "default=kill; $P_THR,socket" -- "$TRY" thread socket
+	t 'kill_thread spares the sibling thread'       97 -- $TO "$SC" \
+	    -a "default=kill; $P_THR; kill_thread=socket" -- "$TRY" thread socket
+	t 'kill_process takes the whole thread group'  159 -- $TO "$SC" \
+	    -a "default=kill; $P_THR; kill=socket" -- "$TRY" thread socket
+else
+	for n in 'control: the sibling thread is what made the call' \
+	         'control: and the permitted call succeeded' \
+	         'kill_thread spares the sibling thread' \
+	         'kill_process takes the whole thread group'; do
+		skipt "$n" "kernel lacks kill_thread or kill_process"
+	done
+fi
 
 # ===========================================================================
 # 4. trap raises SIGSYS too, and unlike kill it is catchable
@@ -220,6 +252,63 @@ t 'default=log lets everything through' 0 -- $TO "$SC" \
     -a "default=log" -- "$TRY" call socket
 else
 skipt 'default=log lets everything through' "kernel has no log action"
+fi
+
+# Allowing the call is half of what log= claims. The other half is the record,
+# and the kernel decides whether there is one: actions_logged is the set of
+# actions it will emit for, and this file is produced by kernel code that
+# nothing in seccompc reads. It is NOT evidence that anything was written. It
+# says only that the action is in the set, so a missing record is the audit
+# subsystem and not the policy.
+PROCLOG=/proc/sys/kernel/seccomp/actions_logged
+if has_action log && [ -r "$PROCLOG" ]; then
+	if grep -qw log "$PROCLOG"; then
+		ok 'the kernel lists log in its logged-actions set'
+	else
+		bad 'the kernel lists log in its logged-actions set' \
+		    "$PROCLOG says [$(cat "$PROCLOG")]"
+	fi
+else
+	skipt 'the kernel lists log in its logged-actions set' \
+	      "no readable $PROCLOG"
+fi
+
+# And then the record itself, looked for rather than assumed either way. Three
+# sinks, in the order they are likely to work: the journal's copy of the kernel
+# ring buffer, dmesg, and the audit log. A record found means the assertion is
+# made; none found anywhere means a loud skip naming the sink that was reachable
+# and still empty, which is a different fact from "no sink was readable".
+if has_action log; then
+	LOGSINK=none
+	cur=''
+	if command -v journalctl >/dev/null 2>&1 &&
+	   cur=$(journalctl -k -n 1 --show-cursor --no-pager 2>/dev/null |
+	         sed -n 's/^-- cursor: //p') && [ -n "$cur" ]; then
+		LOGSINK=journal
+	elif dmesg >/dev/null 2>&1; then
+		LOGSINK=dmesg
+	elif [ -r /var/log/audit/audit.log ]; then
+		LOGSINK=auditlog
+	fi
+	$TO "$SC" -a "default=errno:ENOSYS; allow=$BASE; log=socket" -- \
+	    "$TRY" call socket >/dev/null 2>&1
+	case $LOGSINK in
+	journal)  sleep 1
+	          journalctl -k --after-cursor "$cur" --no-pager 2>/dev/null \
+	              > "$TD/klog" || : ;;
+	dmesg)    dmesg 2>/dev/null | tail -50 > "$TD/klog" ;;
+	auditlog) tail -50 /var/log/audit/audit.log > "$TD/klog" 2>/dev/null ;;
+	*)        : > "$TD/klog" ;;
+	esac
+	if [ "$LOGSINK" = none ]; then
+		skipt 'log= writes a record the kernel can be asked for' \
+		      'no readable kernel log sink: dmesg, the journal and the audit log are all refused'
+	elif grep -q 'seccomp' "$TD/klog"; then
+		ok "log= writes a record, found in the $LOGSINK"
+	else
+		skipt 'log= writes a record the kernel can be asked for' \
+		      "the $LOGSINK is readable and holds no seccomp record: audit_seccomp() emits nothing while audit_enabled is 0, and turning audit on needs CAP_AUDIT_CONTROL"
+	fi
 fi
 
 # ===========================================================================
@@ -349,8 +438,49 @@ fi
 # the bit in rax, which is what an x32 binary's calls look like to seccomp.
 t 'the x32 bit is killed, not defaulted'    159 -- $TO "$SC" \
     -a 'default=allow' -- "$TRY" x32 getuid
+# And the SCOPE of that kill, which matters because the arch range check is
+# the whole security of the program and a weaker action there is a smaller
+# change than removing it. The sibling thread makes the x32-biased call, so
+# KILL_THREAD in place of KILL_PROCESS at instruction 5 stops being
+# indistinguishable from the right answer and becomes 97 instead of 159.
+if has_action kill_process; then
+	t 'the foreign-arch kill takes the whole group'  159 -- $TO "$SC" \
+	    -a "default=allow" -- "$TRY" threadx32 getuid
+else
+	skipt 'the foreign-arch kill takes the whole group' \
+	      'kernel has no kill_process action'
+fi
 t 'and allowed without the bit, same policy'  0 -- $TO "$SC" \
     -a 'default=allow' -- "$TRY" call getuid
+
+# The reconstruction above sets the bit from a 64-bit process, so the number it
+# puts in rax is ours. t/tryx32 is the same source built with -mx32, where the
+# whole syscall table carries the bit and the compiler reads it out of the
+# kernel's uapi header, and a _Static_assert in t/try.c fails the build if the
+# two disagree. So this assertion is about the constant, not the entry path:
+# the binary existing is the evidence that the header was consulted and agreed.
+if [ -s "$ROOT/t/tryx32" ]; then
+	ok 'the x32 syscall bit agrees with the uapi header (-mx32 build)'
+	# Whether the entry path itself can be driven is a separate question
+	# and the kernel's to answer. CONFIG_X86_X32_ABI=n makes execve of an
+	# x32 binary fail with ENOEXEC, and the shell reports that as 126.
+	"$ROOT/t/tryx32" call getuid >/dev/null 2>&1; x32st=$?
+	if [ "$x32st" -eq 126 ]; then
+		skipt 'a real x32 binary is killed by the arch range check' \
+		      'this kernel will not exec an x32 binary (CONFIG_X86_X32_ABI=n)'
+	elif [ "$x32st" -eq 0 ]; then
+		t 'a real x32 binary is killed by the arch range check' 159 -- \
+		    $TO "$SC" -a 'default=allow' -- "$ROOT/t/tryx32" call getuid
+	else
+		bad 'a real x32 binary is killed by the arch range check' \
+		    "unfiltered t/tryx32 exited $x32st, neither 0 nor ENOEXEC"
+	fi
+else
+	skipt 'the x32 syscall bit agrees with the uapi header (-mx32 build)' \
+	      'no -mx32 toolchain'
+	skipt 'a real x32 binary is killed by the arch range check' \
+	      'no -mx32 toolchain'
+fi
 # A negative syscall number loads as a huge unsigned word, which the same
 # compare catches. Unfiltered the kernel answers ENOSYS; filtered it is a kill,
 # which is the deliberate difference.

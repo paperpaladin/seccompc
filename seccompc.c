@@ -109,6 +109,12 @@ static void *xmalloc(size_t n) {
 	return p;
 }
 
+static void *xrealloc(void *p, size_t n) {
+	void *q = realloc(p, n);
+	if (!q) die("out of memory");
+	return q;
+}
+
 static void usage(FILE *f) {
 	fprintf(f,
 	    "usage: %s -a POLICY -- CMD [ARGS...]   install filter, exec CMD\n"
@@ -857,6 +863,27 @@ static struct sock_filter *read_filter(const char *path, int *out_n) {
 		die("%s: more than the kernel's limit of %d instructions",
 		    path, BPF_MAXINSNS);
 	*out_n = (int)(got / isz);
+
+	/*
+	 * Shrink to what arrived. Nothing below needs the slack, and leaving
+	 * it there would switch the sanitizer off over the one buffer in this
+	 * program holding bytes someone else wrote: a filter file is typically
+	 * 72 bytes inside a 32776-byte allocation, so a read one instruction
+	 * past the end would land 32 KB inside a live object and ASan would
+	 * say nothing. `make overread` plants exactly that read and fails
+	 * unless the sanitizer reports it.
+	 */
+	f = xrealloc(f, got);
+#ifdef SECCOMPC_OVERREAD
+	/*
+	 * The planted read, one instruction past the program. Written to a
+	 * volatile so no optimiser can decide it never happened.
+	 */
+	{
+		static volatile uint16_t sink;
+		sink = f[*out_n].code;
+	}
+#endif
 	return f;
 }
 

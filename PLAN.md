@@ -6,6 +6,7 @@
 seccompc -a POLICY -- CMD [ARGS...]   install the filter, then exec CMD
 seccompc -c POLICY -o FILE            compile POLICY to a filter file
 seccompc -d FILE                      disassemble a filter file
+seccompc --probe FILE                 ask the kernel to load FILE, report its verdict
 seccompc --actions                    the seccomp actions this kernel has
 ```
 
@@ -97,7 +98,12 @@ the order of what each would cost us to get wrong.
    one filter.
 4. `kill`, `trap` and `log` are the mechanisms claimed. `kill` is wait
    status 159 and is *not* caught by a handler that does catch `trap`. The pair
-   is the assertion. Either line alone says nothing.
+   is the assertion. Either line alone says nothing. The scope of a kill is
+   the same shape: a sibling thread makes the denied call, and `kill_thread`
+   leaves the other thread to exit 97 where `kill_process` takes the group to
+   159. Dropping `clone` from that policy, or having the main thread make the
+   call instead of the sibling, turns the control and the 97 red, so the group
+   cannot pass with no second thread in it.
 5. `strace` as an independent witness. It sees `socket(...) = -1 EPERM`, and
    `-1 ENOSYS` when only the policy changed; it sees `PR_SET_NO_NEW_PRIVS`
    precede `SECCOMP_SET_MODE_FILTER`, and it reports the program length the
@@ -125,7 +131,12 @@ the order of what each would cost us to get wrong.
     control/refusal pairs. This clamps our own answer downward, so it proves
     the refusal logic, not the behaviour of an old kernel: the same
     honesty gap `JAIL_ABI_MAX` has, and named as such.
-12. Disassembly round trip. The weakest oracle here, and labelled so in
+12. The sanitizer, over a buffer sized to what arrived. `make overread`
+    plants a read one instruction past a filter file and fails unless ASan
+    reports a heap overflow. It is a prerequisite of `make test` because it
+    is the only witness to its own property: with the shrink in
+    `read_filter` reverted, the suite still prints 0 failed.
+13. Disassembly round trip. The weakest oracle here, and labelled so in
     `t/run.sh` itself. Both the emitter and the disassembler are ours, so a
     shared misunderstanding passes. It exists to catch a regression in
     instruction order and establishes nothing about correctness; item 1 is what
@@ -180,7 +191,7 @@ Granularity is for `git bisect` and `git revert`, so every commit builds.
       why: the oracle needs a program that reports errno numerically and
       depends on nothing, and it needs an i386 twin, because the arch check is
       otherwise a claim, not a measurement.
-- [x] `t/run.sh`, 107 assertions, since grown to 125.
+- [x] `t/run.sh`, 107 assertions, since grown to 137.
       why: one commit, not one per group, because the groups share the
       fixtures and the skip path and splitting them would mean a dozen commits
       each adding three lines to the same file. The two harness bugs found
@@ -218,20 +229,65 @@ Granularity is for `git bisect` and `git revert`, so every commit builds.
       ourselves, and a filter we *refuse* and the kernel would accept is
       invisible. The fork is needed because a successful install may then deny
       the write that would report it.
-- [ ] Drive x32 through a real x32 binary, not by setting bit 30 in
-      `rax` from a 64-bit process.
-      why: the bit is what seccomp sees either way, so the assertion is sound,
-      but it is a reconstruction of the x32 entry path, not the path
-      itself. `CONFIG_X86_X32_ABI` and an x32 toolchain would settle it.
-- [ ] Observe `kill_process` differing from `kill_thread` by giving the probe a
+- [x] BLOCKED, re-probed 2 November 2026: drive x32 through a real x32 binary
+      rather than by setting bit 30 in `rax` from a 64-bit process. What was
+      done instead: `t/tryx32` is the probe built with `-mx32`, and a
+      `_Static_assert` in `t/try.c` compares `__NR_getuid` against
+      `X32_BIT | 102`, so the constant the 64-bit reconstruction uses now has
+      an authority outside this repository.
+      why it is blocked, measured rather than inferred: the entry path cannot
+      be driven here because `execve` of that binary fails with `ENOEXEC`, so
+      `CONFIG_X86_X32_ABI` is off on 7.2.13-200.fc44.x86_64. The suite runs
+      the unfiltered binary, reads 126 back from the shell, and skips with
+      that reason. On a kernel with x32 enabled the assertion runs.
+      What this item used to say was the blocker was two things, an x32
+      toolchain and the kernel option. The toolchain half was wrong: no
+      distribution ships an x32 libc, but a freestanding build needs none and
+      the ordinary gcc here produces the binary.
+- [x] Observe `kill_process` differing from `kill_thread` by giving the probe a
       second thread.
-      why: the only assertion in the suite that is currently a skip. One
-      `clone(CLONE_THREAD)` in the probe makes the difference observable: the
-      sibling thread survives one and not the other.
-- [ ] Assert that `log` actually logs, by reading the audit log or dmesg.
-      why: `log=` is asserted to allow the call, which is half of what it
-      claims. The other half needs `/proc/sys/kernel/seccomp/actions_logged`
-      and a readable audit sink, neither of which is guaranteed.
+      why: this was the only skip in the suite. `try thread` clones a sibling
+      with `CLONE_THREAD|CLONE_CHILD_CLEARTID` and the sibling makes the
+      denied call, so `do_exit(SIGSYS)` and `do_group_exit(SIGSYS)` become 97
+      and 159 seen from outside. Three assertions, one of them the control
+      that has the sibling's call succeed and report in its own words, because
+      97 on its own would also appear for a filter that did nothing to the
+      sibling. `try threadx32` is the same sibling calling through the x32
+      bit, which makes the scope of the foreign-arch kill observable too.
+- [ ] BLOCKED, measured 2 November 2026: assert that `log` actually logs.
+      why it is blocked: the kernel emits nothing to log. `seccomp_log()`
+      calls `audit_seccomp()`, which returns without writing while
+      `audit_enabled` is 0, and this kernel booted without `audit=1`. Both a
+      `log=socket` call and a `kill_process` death were run and neither left a
+      record. Turning audit on needs `CAP_AUDIT_CONTROL` and `CapEff` here is
+      empty.
+      The reason this item used to give was "neither
+      `/proc/sys/kernel/seccomp/actions_logged` nor a readable audit sink is
+      guaranteed", and both halves of that are wrong on this machine.
+      `actions_logged` is readable and lists `log`, which the suite now
+      asserts. And a sink is readable: `dmesg` is refused
+      (`dmesg_restrict` is 1, no `CAP_SYSLOG`) and `/var/log/audit` is
+      refused, but `journalctl -k` works and holds the kernel ring buffer.
+      It is empty of seccomp records, which is a different fact from having
+      no way to look. The suite probes all three sinks at run time and names
+      the one it reached, so this starts measuring the moment audit is on.
+
+- [x] Shrink the filter-file buffer to what arrived, and a `make overread`
+      gate over it.
+      why: `read_filter` allocated `(BPF_MAXINSNS + 1) * 8` = 32776 bytes for
+      a file that is typically 72, which is the shape recorded in
+      `projects/METHOD.md` as having turned the sanitizer off in twenty-one
+      buffers across fifteen repositories. This is the one buffer here holding
+      bytes someone else wrote, so a read one instruction past the program
+      landed 32 KB inside a live object. Measured rather than reasoned: with
+      the shrink reverted the planted read exits 0 and ASan says nothing,
+      while `make test` prints 0 failed either way, which is why the gate is a
+      prerequisite of the suite and not a chore beside it.
+      Nothing else in the program has the shape. `emit()` allocates
+      `2 * nrule + 7` and writes exactly that many, the policy copy is
+      `strlen(policy) + 1`, and `preflight`'s `char buf[PATH_MAX]` is written
+      only by `snprintf` and read only to its NUL, so there is no read to
+      plant in it.
 
 ### Milestone 2: things the filter cannot currently express
 

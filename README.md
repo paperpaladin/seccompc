@@ -13,9 +13,10 @@ every descendant, and the command cannot take it off.
 ## Build
 
 ```
-make            # seccompc, plus the test probes t/try and t/try32
-make test
+make            # seccompc, plus the probes t/try, t/try32 and t/tryx32
+make test       # runs make overread first
 make test-asan  # the same suite under -fsanitize=address,undefined
+make overread   # one planted read ASan must report; see below
 make clean
 ```
 
@@ -29,6 +30,7 @@ skips those assertions loudly if it is absent.
 seccompc -a POLICY -- CMD [ARGS...]   install the filter, then exec CMD
 seccompc -c POLICY -o FILE            compile POLICY to a filter file
 seccompc -d FILE                      disassemble a filter file
+seccompc --probe FILE                 ask the kernel to load FILE, report its verdict
 seccompc --actions                    the seccomp actions this kernel has
 ```
 
@@ -144,15 +146,22 @@ Ranked by how little we control them:
    cannot fail on this machine, so any errno seen is the filter's.
 4. `kill` / `trap` / `log` are the mechanisms claimed. `kill` is wait
    status 159 and is *not* caught by a handler that does catch `trap`.
-5. `strace` as an independent witness. Where strace and this program
+5. The scope of a kill, through a second thread. A sibling made with
+   `CLONE_THREAD` makes the denied call, so `kill_thread` leaves the other
+   thread to exit 97 where `kill_process` takes the whole group to 159.
+6. `strace` as an independent witness. Where strace and this program
    disagree, this program is wrong.
-6. Allowed syscalls still work, and strace counts the syscalls actually
+7. Allowed syscalls still work, and strace counts the syscalls actually
    executed under a filter, which must exceed ten.
-7. Inheritance by fork, by exec, and by a grandchild.
-8. Transparency, through a real dynamically linked program.
-9. Malformed filter files, twelve refusals, each also under ASan+UBSan.
-10. `--actions` against `/proc/sys/kernel/seccomp/actions_avail`.
-11. Disassembly round trip: the weakest oracle here, and labelled so in
+8. Inheritance by fork, by exec, and by a grandchild.
+9. Transparency, through a real dynamically linked program.
+10. Malformed filter files, twelve refusals, each also under ASan+UBSan.
+11. `make overread`, one planted read past a filter file that ASan has to
+    report. A prerequisite of `make test`, because nothing else in the
+    harness can see the property it checks.
+12. `--actions` against `/proc/sys/kernel/seccomp/actions_avail`, and
+    `log` against `actions_logged`.
+13. Disassembly round trip: the weakest oracle here, and labelled so in
     `t/run.sh` itself. Both the emitter and the disassembler are ours, so a
     shared misunderstanding passes. It catches regressions in instruction
     order and establishes nothing about correctness; item 1 is what does that.
@@ -160,9 +169,10 @@ Ranked by how little we control them:
 ### `make test`
 
 ```
+    ok    overread: ASan reported the planted read
     seccomp actions: kill_process kill_thread trap errno user_notif trace log allow
-    on 7.2.8-200.fc44.x86_64, filter binary ./seccompc
-    
+    on 7.2.13-200.fc44.x86_64, filter binary ./seccompc
+
     ok    --actions agrees with the proc file
     ok    allowed getuid works
     ok    allowed geteuid works
@@ -186,17 +196,22 @@ Ranked by how little we control them:
     ok    default=kill: allowed still runs
     ok    kill= clause: dies of SIGSYS
     ok    kill_thread= clause: SIGSYS
-    skip  kill_process differs from kill_thread  (the probe is single-threaded, so both are the same death)
+    ok    control: the sibling thread is what made the call
+    ok    control: and the permitted call succeeded
+    ok    kill_thread spares the sibling thread
+    ok    kill_process takes the whole thread group
     ok    trap with no handler: SIGSYS
     ok    trap with a handler: caught
     ok    kill is not catchable
     ok    log= lets the call through
     ok    default=log lets everything through
+    ok    the kernel lists log in its logged-actions set
+    skip  log= writes a record the kernel can be asked for  (the journal is readable and holds no seccomp record: audit_seccomp() emits nothing while audit_enabled is 0, and turning audit on needs CAP_AUDIT_CONTROL)
     ok    strace sees socket return EPERM
     ok    strace sees the errno change to ENOSYS
     ok    strace sees PR_SET_NO_NEW_PRIVS first
     ok    strace sees SECCOMP_SET_MODE_FILTER
-    ok    strace counted 105 syscalls under the filter
+    ok    strace counted 107 syscalls under the filter
     ok    kernel and -d agree the filter is 9 instructions
     ok    forked child is still filtered
     ok    forked child keeps what is allowed
@@ -218,7 +233,10 @@ Ranked by how little we control them:
     ok    i386 nr 102 is killed, not allowed
     ok    default=allow still kills a foreign arch
     ok    the x32 bit is killed, not defaulted
+    ok    the foreign-arch kill takes the whole group
     ok    and allowed without the bit, same policy
+    ok    the x32 syscall bit agrees with the uapi header (-mx32 build)
+    skip  a real x32 binary is killed by the arch range check  (this kernel will not exec an x32 binary (CONFIG_X86_X32_ABI=n))
     ok    control: nr -1 is ENOSYS unfiltered
     ok    nr -1 is killed under a filter
     ok    exit status 0 passes through
@@ -295,8 +313,13 @@ Ranked by how little we control them:
     ok    control: allow compiles when available
     ok    a missing allow action is refused
     ok    --actions honours the clamp
-    
-    130 passed, 0 failed, 1 skipped
+    ok    the corpus has both verdicts in it: 6 accepted, 5 refused
+    ok    the validator agrees with the kernel on all 11 filters
+    ok    every filter in the corpus got an answer from the kernel
+    ok    a validator that accepts everything is available to test against
+    ok    and the comparison catches it: 2 disagreements
+
+    137 passed, 0 failed, 2 skipped
 ```
 
 The escape transcript is the interesting one. Clearing `no_new_privs` is
@@ -315,8 +338,10 @@ never dressed up as a pass.
 
 ## Mutation testing
 
-The question is not whether the tests pass. Twenty-seven deliberate defects,
-twenty-six caught by a named assertion:
+The question is not whether the tests pass. Thirty-four deliberate defects in
+the table below, thirty-three of them caught by a named assertion, a named
+target or the build. Three more are in the `--probe` section above, all
+caught.
 
 | mutation | caught by |
 |---|---|
@@ -326,12 +351,19 @@ twenty-six caught by a named assertion:
 | load `nr` where `arch` belongs | 50 |
 | remove the x32 / negative-`nr` range check | 5 |
 | `jgt` -> `jge` in that range check | 3 (structural only) |
+| the nr range check returns `KILL_THREAD`, not `KILL_PROCESS` | 1 |
+| the arch check returns `KILL_THREAD`, not `KILL_PROCESS` | 3 (structural only) |
 | per-rule errno off by one | 11 |
 | default action forced to `ALLOW` | 8 |
 | per-rule action forced to `ALLOW` | 17 |
 | invert the per-rule jump | 30 |
 | per-rule `jeq` compares `nr+1` | 43 |
-| `KILL_THREAD` instead of `KILL_PROCESS` for a foreign arch | 3 (structural only) |
+| `kill_thread=` emits `KILL_PROCESS` | 2 |
+| `kill=` emits `KILL_THREAD` | 2 |
+| the shrink in `read_filter` reverted | `make overread` alone |
+| the x32 bit in `t/try.c` off by one | the `-mx32` build |
+| harness: `clone` dropped from the thread policy | 3 |
+| harness: the main thread makes the call, not the sibling | 2 |
 | drop `PR_SET_NO_NEW_PRIVS` | 57 |
 | validator ignores out-of-range jumps | 2 |
 | validator ignores a partial instruction | 2 |
@@ -356,12 +388,26 @@ action could tell them apart, and `SECCOMPC_NO_ACTION` drives the surrounding
 logic instead.
 
 Three mutations are caught only by the structural check, the weakest
-oracle in the suite, and all three are observationally identical to a
-single-threaded probe making real syscalls: `jgt` -> `jge` differs only at
-`nr == 0x3fffffff`, a number that is no syscall; `KILL_THREAD` and `KILL_PROCESS`
-are the same death for a process with one thread, and swapped `jt`/`jf` in the
-disassembler changes no filter. The structural check earning its place on those
-three is the argument for keeping it, and the reason it is still ranked last.
+oracle in the suite. `jgt` -> `jge` in the range check differs only at
+`nr == 0x3fffffff`, which is no syscall. Swapped `jt`/`jf` in the disassembler
+changes no filter. And the arch check's own return weakened from
+`KILL_PROCESS` to `KILL_THREAD` is reachable only from a foreign arch, which
+here means `t/try32`, a single-threaded program where the two are the same
+death. The structural check earning its place on those three is the argument
+for keeping it, and the reason it is still ranked last.
+
+That third one used to cover both of the filter's kill returns, and the
+sibling thread took one of them off the list: weaken the `nr` range check's
+return and the thread making an x32-biased call exits 97 where it should have
+taken the group to 159. Closing the remaining one needs a second thread in the
+i386 probe, which is 30 lines for one assertion and has not been written.
+
+Two harness mutations are in the table because the thread group is the kind
+that can pass with nothing in it. Drop `clone` from the policy and the sibling
+is never made; have the main thread make the call instead and there is no
+sibling to spare. Both turn the control red. In the second, `kill_process
+takes the whole thread group` stays green, which is the whole reason the
+group is three assertions and not one.
 
 Four mutations survived the first sweep and three of them were real holes, all
 of the same shape, a fixture that was being refused for the wrong reason:
@@ -389,7 +435,9 @@ of the same shape, a fixture that was being refused for the wrong reason:
   running kernel before anything is installed.
 - The arch check and the `nr` range check, both driven against the kernel.
 - `errno=` gives exactly the errno named, 1..4095, by name or by number.
-- `trap` is catchable and `kill` is not, both asserted.
+- `trap` is catchable and `kill` is not, both asserted. So is the scope of a
+  kill, through a sibling thread: `kill_thread` leaves it running,
+  `kill_process` does not.
 - Fully transparent: seccompc `exec`s, so exit status, signal death and all
   three standard streams are the command's own by construction.
 - Fails closed: a malformed policy, an unknown syscall name, an action this
@@ -445,10 +493,49 @@ being compared and everything stays green.
 comparison can be shown to notice a validator that is wrong. Three
 mutations, all caught.
 
+## The buffer that was larger than its data
+
+`read_filter` allocated `(BPF_MAXINSNS + 1) * sizeof(struct sock_filter)`,
+32776 bytes, for a filter file that is typically 72. That is the one buffer in
+this program filled with bytes someone else wrote, and at that size a read one
+instruction past the program lands 32 KB inside a live allocation, where no
+sanitizer can see it. `projects/METHOD.md` records the same shape in
+twenty-one buffers across fifteen repositories, none of them found by a
+sanitizer.
+
+One `realloc` down to the byte count that arrived fixes it, and `make
+overread` is what keeps it fixed: `-DSECCOMPC_OVERREAD` plants a read at
+`f[*out_n]` and the target fails unless ASan reports a heap overflow, with
+exit 86, a status `-d` cannot produce by any other route.
+
+The gate is a prerequisite of `make test` because it is the only witness.
+With the `realloc` reverted:
+
+```
+$ t/run.sh ./seccompc
+137 passed, 0 failed, 2 skipped
+$ make overread
+FAIL  overread: exit 0, no heap-buffer-overflow reported
+```
+
+Nothing else in the harness can tell the difference, and `make test-asan` is
+green both ways.
+
+Nothing else here has the shape, checked rather than assumed. `emit()`
+allocates `2 * nrule + 7` instructions and writes exactly that many, the
+policy copy is `strlen(policy) + 1`, and `preflight`'s `char buf[PATH_MAX]` is
+written only by `snprintf` and read only as far as its NUL, so there is no
+read to plant in it.
+
 ## What does not work
 
 Honestly, and this list is longer than the one above. Twenty-one entries,
-every one either measured here or named as untested.
+every one either measured here or named as untested. Four were re-probed on
+2 November 2026. The x32 entry gave two blockers and one of them was not real;
+the `log=` entry gave two and neither was; the `-d` validator entry described
+a gap that `--probe` had already closed; and `kill_process` against
+`kill_thread` was true and is now measured for the pair, with one return
+left over.
 
 - `execve` cannot be denied to CMD. The filter must be installed before the
   exec that starts CMD, because a process cannot install a filter on a process
@@ -500,26 +587,47 @@ every one either measured here or named as untested.
   diffing and feeding to some other program; `-a` recompiles from the policy.
   So `-c` plus `-d` is a loop that never reaches the kernel. That is exactly
   why the round trip ranks last as an oracle.
-- The `-d` validator has no external authority. It is ours, and it is not
-  checked against the kernel's `bpf_check_classic()`. A filter we accept and
-  the kernel refuses shows up only indirectly, as an install failure on a
-  filter we emitted ourselves. A filter we *refuse* and the kernel would accept
-  is invisible. The fix is a probe mode that loads a filter file in a forked
-  child and reports the kernel's errno, and it is item 1 in `PLAN.md`.
+- The `-d` validator used to have no external authority, and `--probe` is the
+  answer; see the section above. What is left is the corpus: 11 filters, 6
+  accepted and 5 refused, which is a sample of the shapes
+  `bpf_check_classic()` rejects and not a sweep of them.
 - `-d` is a seccomp disassembler, not a BPF one. It refuses an absolute
   load outside the 64 bytes of `seccomp_data`, because the kernel does, so it
   is useless for socket filters.
-- x32 is driven by reconstruction, with no x32 binary involved. The 64-bit probe
-  sets bit 30 in `rax`, and seccomp sees that either way, so the assertion
-  is sound, but it is not the x32 entry path itself. That needs
-  `CONFIG_X86_X32_ABI` and an x32 toolchain.
-- `kill_process` and `kill_thread` are not distinguished. They differ only
-  in how much of a multi-threaded process they take down, the probe has one
-  thread, and the suite reports that as a skip instead of inventing an
-  assertion.
-- `log=` is asserted to allow the call, not to log it. The other half needs
-  `/proc/sys/kernel/seccomp/actions_logged` and a readable audit sink, neither
-  guaranteed. The filter is also installed with flags 0, so there is no
+- The x32 entry path is not driven, and the blocker is the kernel. The 64-bit
+  probe sets bit 30 in `rax`, which is what seccomp sees either way, so the
+  assertion is sound without being the entry path itself. `t/tryx32` is the
+  same source built with `-mx32` and this kernel refuses to exec it with
+  `ENOEXEC`, so `CONFIG_X86_X32_ABI` is off; the suite runs the unfiltered
+  binary, reads 126 back, and skips with that reason rather than guessing.
+  This entry used to name an x32 toolchain as the other half of the blocker
+  and that was wrong: no distribution ships an x32 libc, but the probe is
+  freestanding and needs none. What the `-mx32` build does buy is an outside
+  authority for the constant. A `_Static_assert` in `t/try.c` compares
+  `__NR_getuid` against `X32_BIT | 102`, read by the compiler out of the
+  kernel's uapi header in x32 mode, and the build fails if the reconstruction
+  is off by anything.
+- One kill return is still indistinguishable, and it is not the pair. The
+  probe now clones a sibling with `CLONE_THREAD`, so `kill_thread` and
+  `kill_process` are told apart by exit 97 against 159. The arch check's own
+  return is reachable only from a foreign arch, which means `t/try32`, and
+  that program has one thread, so weakening *that* `KILL_PROCESS` to
+  `KILL_THREAD` is caught by the structural check alone.
+- `log=` is asserted to allow the call, and the record is the kernel's to
+  write. It writes nothing here: `seccomp_log()` calls `audit_seccomp()`,
+  which returns without emitting while `audit_enabled` is 0, and this kernel
+  booted without `audit=1`. Measured both ways, with a `log=socket` call and
+  with a `kill_process` death, and neither left a trace.
+  The reason this entry used to give was that neither `actions_logged` nor a
+  readable audit sink is guaranteed. Both halves are wrong on this machine.
+  `actions_logged` is readable and lists `log`, which the suite asserts. And
+  a sink is readable: `dmesg` is refused (`dmesg_restrict` is 1 and `CapEff`
+  is empty, so no `CAP_SYSLOG`) and `/var/log/audit` is refused, but
+  `journalctl -k` carries the kernel ring buffer and can be read. It holds no
+  seccomp record, which is a different fact from having no way to look. The
+  suite probes all three sinks at run time, names the one it reached, and
+  starts asserting the moment one of them has a record in it.
+  The filter is also installed with flags 0, so there is no
   `SECCOMP_FILTER_FLAG_LOG`.
 - The missing-action refusal is tested by clamping our own answer.
   `SECCOMPC_NO_ACTION=NAME` proves the refusal logic, on the real kernel,
@@ -552,7 +660,7 @@ every one either measured here or named as untested.
 
 ## Design
 
-One source file plus the probe. `seccompc.c` is 1031 lines, a quarter of them
+One source file plus the probe. `seccompc.c` is 1181 lines, a quarter of them
 comments explaining why the kernel insists on something.
 
 ```

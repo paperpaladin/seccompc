@@ -3,6 +3,7 @@ seccompc
 seccompc-asan
 t/try
 t/try32
+t/tryx32
 
 # editor / tooling debris
 *.o

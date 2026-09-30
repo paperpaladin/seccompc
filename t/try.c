@@ -8,13 +8,16 @@
  *   try trap NAME            catch SIGSYS first, then make it
  *   try escape NAME          try every way out of the filter, then make it
  *   try fork NAME            make it in a child, relay the child's fate
+ *   try thread NAME          make it in a sibling THREAD, report who survived
+ *   try threadx32 NAME       the same, with the x32 bit, for the arch check
  *   try exec PROG ARGS...    execve PROG, which inherits the filter
  *
  * Exit status is the point: 0 if the syscall succeeded, otherwise the errno as
  * a number, so "denied with EPERM" can never be confused with "denied with
  * ENOSYS" or with "the call failed for its own ordinary reasons". 99 means a
- * SIGSYS handler ran. A relayed death by signal comes back as 128+signal, the
- * same number a shell would report.
+ * SIGSYS handler ran, 97 that a sibling thread died while this one lived, 98
+ * that a sibling neither died nor reported. A relayed death by signal comes
+ * back as 128+signal, the same number a shell would report.
  *
  * Freestanding: no libc, no dynamic loader, its own _start, every syscall by
  * hand. That is not minimalism for its own sake. A probe linked against glibc
@@ -48,6 +51,21 @@
 #define PR_SET_SECCOMP 22
 #define SECCOMP_MODE_DISABLED 0
 #define X32_BIT 0x40000000L
+
+/*
+ * x32 compiles through this half of the file, not the i386 half: pointers are
+ * 32 bits under -mx32 but the syscall instruction and the registers it uses
+ * are the 64-bit ones. The assert is most of the reason to build it at all.
+ * X32_BIT is a constant the 64-bit probe uses to RECONSTRUCT what an x32
+ * caller puts in rax, and the kernel's own uapi header, read by the compiler
+ * in x32 mode, is the only authority outside this repository for it. Under
+ * -mx32 the whole x32 table is biased by that bit, so getuid is 0x40000066
+ * and the reconstruction is either exactly right or this does not build.
+ */
+#ifdef __ILP32__
+_Static_assert(__NR_getuid == (X32_BIT | 102),
+    "the x32 syscall bit is not what the 64-bit probe reconstructs");
+#endif
 
 /*
  * Raw syscalls. The return value is the kernel's: negative errno on failure,
@@ -256,6 +274,96 @@ static void forked(int i, const char *name) {
 	relay(status);
 }
 
+/* ------------------------------------------------------------ thread ----- */
+
+/*
+ * KILL_PROCESS and KILL_THREAD are the same death for a process with one
+ * thread, which is why the suite reported the difference as a skip for as long
+ * as the probe had only one. A sibling thread makes them tell apart:
+ *
+ *   KILL_THREAD   the sibling dies, this thread lives on and exits 97
+ *   KILL_PROCESS  the whole thread group goes, and the harness sees 159
+ *
+ * The kernel's own distinction, at the bottom of __seccomp_filter, is
+ * do_exit(SIGSYS) against do_group_exit(SIGSYS). Nothing here reads it; the
+ * two outcomes are observed from outside, and the pair is the assertion. One
+ * line alone says nothing, since a filter that killed everything would satisfy
+ * the second for free.
+ *
+ * CLONE_CHILD_CLEARTID is the channel, and it is chosen because it is the
+ * kernel's and not ours: mm_release zeroes the word and wakes anyone on it,
+ * for every exit path including a fatal signal. A dying thread cannot report
+ * its own death, so the report has to come from somewhere it does not run.
+ */
+#define CLONE_VM_F              0x00000100
+#define CLONE_SIGHAND_F         0x00000800
+#define CLONE_THREAD_F          0x00010000
+#define CLONE_CHILD_CLEARTID_F  0x00200000
+
+static volatile int sib_tid;
+static int sib_call;
+static long sib_bias;
+static char sib_stack[8192] __attribute__((aligned(16)));
+
+void sibling_main(void);
+
+void sibling_main(void) {
+	/* If the call is permitted this reports and exits the group, which is
+	 * the control: it proves the sibling really runs and really calls. */
+	report("call-in-sibling", calls[sib_call].name,
+	    do_call(sib_call, sib_bias));
+}
+
+/*
+ * The child cannot enter a C function through the ordinary return path of a
+ * syscall wrapper. clone gives it a new stack pointer and the compiler is
+ * entitled to address the caller's locals through that register, so the switch
+ * happens here and the child's first C frame is a function taking nothing and
+ * returning nowhere.
+ */
+__asm__(".globl try_clone_thread\n"
+        "try_clone_thread:\n"            /* rdi flags, rsi stacktop, rdx ctid */
+        "\tmov %rdx, %r10\n"             /* child_tidptr is clone's 4th arg */
+        "\txor %edx, %edx\n"             /* parent_tidptr: not wanted */
+        "\tmov $56, %eax\n"              /* __NR_clone */
+        "\tsyscall\n"
+        "\ttest %eax, %eax\n"
+        "\tjnz 1f\n"
+        "\txor %rbp, %rbp\n"
+        "\tand $-16, %rsp\n"
+        "\tcall sibling_main\n"
+        "\thlt\n"
+        "1:\tret\n");
+extern long try_clone_thread(long flags, void *stacktop, volatile int *ctid);
+
+static void threaded(int i, const char *name, long bias) {
+	long tid;
+
+	sib_call = i;
+	sib_bias = bias;
+	sib_tid = -1;
+	tid = try_clone_thread(CLONE_VM_F | CLONE_SIGHAND_F | CLONE_THREAD_F |
+	    CLONE_CHILD_CLEARTID_F, sib_stack + sizeof sib_stack, &sib_tid);
+	if (tid < 0) report("clone-thread", name, tid);
+
+	/*
+	 * Bounded, because the alternative to a bound is a harness that hangs
+	 * when this is wrong. sched_yield is a syscall, so every policy using
+	 * this op has to permit it, and the permitted-call control is what
+	 * shows that it does.
+	 */
+	for (long spins = 0; spins < 200000; spins++) {
+		if (sib_tid == 0) {
+			out("note: the sibling thread died and this one did "
+			    "not, so the kill was per-thread\n");
+			xexit(97);
+		}
+		sys3(__NR_sched_yield, 0, 0, 0);
+	}
+	out("FAIL thread: the sibling neither died nor reported\n");
+	xexit(98);
+}
+
 /* -------------------------------------------------------------- main ----- */
 
 void probe_main(long argc, char **argv);
@@ -265,7 +373,7 @@ void probe_main(long argc, char **argv) {
 	int i;
 
 	if (argc < 3) {
-		out("usage: try call|neg|x32|trap|escape|fork NAME | try exec PROG ARGS...\n");
+		out("usage: try call|neg|x32|trap|escape|fork|thread|threadx32 NAME | try exec PROG ARGS...\n");
 		xexit(2);
 	}
 	op = argv[1];
@@ -291,6 +399,12 @@ void probe_main(long argc, char **argv) {
 	if (streq(op, "neg"))    report("neg", "nr=-1", sys3(-1, 0, 0, 0));
 	if (streq(op, "escape")) escape(i, name);
 	if (streq(op, "fork"))   forked(i, name);
+	if (streq(op, "thread")) threaded(i, name, 0);
+	/* The same sibling, calling through the x32 bit, so the action the
+	 * arch range check returns is observable as a scope and not only as a
+	 * death. KILL_THREAD there instead of KILL_PROCESS used to be a mutant
+	 * only the structural check could see. */
+	if (streq(op, "threadx32")) threaded(i, name, X32_BIT);
 	if (streq(op, "trap")) {
 		struct ksigaction act;
 		act.handler = on_sigsys;

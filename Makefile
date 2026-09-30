@@ -15,7 +15,7 @@ PCFLAGS = -std=c11 -O1 -Wall -Wextra -nostdlib -nostartfiles -static -no-pie \
           -ffreestanding -fno-stack-protector -fno-builtin \
           -ffile-prefix-map=$(CURDIR)=.
 
-all: seccompc t/try t/try32
+all: seccompc t/try t/try32 t/tryx32
 
 seccompc: seccompc.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
@@ -33,7 +33,23 @@ t/try32: t/try.c
 	  && echo "$(CC) -m32 ... -o $@ $<" \
 	  || echo "note: no -m32 toolchain; 32-bit bypass tests will be SKIPPED" >&2
 
-test: all
+# The x32 twin. There is no x32 libc on any distribution in common use, which
+# is why the README used to call an x32 toolchain the blocker here; a
+# freestanding build needs none, so this compiles with the ordinary x86-64 gcc.
+# Whether it can RUN is the kernel's answer: CONFIG_X86_X32_ABI=n makes execve
+# return ENOEXEC and t/run.sh says so and skips, loudly. The _Static_assert in
+# t/try.c is what this target buys even when the binary cannot run: it checks
+# the x32 syscall bit against the kernel's uapi header, in x32 mode, rather
+# than against our own belief about it.
+t/tryx32: t/try.c
+	@$(CC) -mx32 $(PCFLAGS) -o $@ $< 2>/dev/null \
+	  && echo "$(CC) -mx32 ... -o $@ $<" \
+	  || echo "note: no -mx32 toolchain; the x32 binary tests will be SKIPPED" >&2
+
+# overread is a prerequisite, not a separate chore, because it is the only
+# witness to its own property: with the shrink in read_filter reverted the
+# suite below still prints 0 failed.
+test: all overread
 	@t/run.sh ./seccompc
 
 # A policy parser and a filter-file reader both chew on bytes someone else
@@ -48,14 +64,38 @@ test: all
 SANOPT = ASAN_OPTIONS=exitcode=86 \
 	 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:exitcode=86
 
-test-asan: t/try t/try32
+test-asan: t/try t/try32 t/tryx32
 	$(CC) -std=c11 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
 		-Wall -Wextra -Wpedantic -ffile-prefix-map=$(CURDIR)=. \
 		-o seccompc-asan seccompc.c
 	@$(SANOPT) t/run.sh ./seccompc-asan
 
+# A buffer larger than its data turns the sanitizer off, and `-d` holds the one
+# buffer here filled with bytes someone else wrote. Before the shrink in
+# read_filter, a 72-byte filter file sat in a 32776-byte allocation, so a read
+# one instruction past the program landed 32 KB inside a live object and ASan
+# reported nothing. This target plants that read and demands a diagnostic.
+#
+# exitcode=86 again, for the same reason as test-asan: `-d` can exit 0 or 125
+# by its own ordinary routes, so a number it cannot otherwise produce is the
+# only unambiguous evidence that the sanitizer, and not the program, spoke.
+overread: seccompc
+	@mkdir -p t/tmp
+	@./seccompc -c 'default=kill; allow=read,write,exit_group,execve' \
+	    -o t/tmp/overread.bpf
+	@$(CC) -std=c11 -g -O1 -fsanitize=address -fno-omit-frame-pointer \
+		-DSECCOMPC_OVERREAD -ffile-prefix-map=$(CURDIR)=. \
+		-o t/tmp/seccompc-overread seccompc.c
+	@ASAN_OPTIONS=exitcode=86 t/tmp/seccompc-overread -d t/tmp/overread.bpf \
+	    >/dev/null 2>t/tmp/overread.log; \
+	 st=$$?; \
+	 if [ $$st -eq 86 ] && grep -q heap-buffer-overflow t/tmp/overread.log; \
+	 then echo "ok    overread: ASan reported the planted read"; \
+	 else echo "FAIL  overread: exit $$st, no heap-buffer-overflow reported"; \
+	      sed 's/^/      | /' t/tmp/overread.log | head -20; exit 1; fi
+
 clean:
-	rm -f seccompc seccompc-asan t/try t/try32
+	rm -f seccompc seccompc-asan t/try t/try32 t/tryx32
 	rm -rf t/tmp
 
-.PHONY: all test test-asan clean
+.PHONY: all test test-asan overread clean
