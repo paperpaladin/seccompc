@@ -620,6 +620,84 @@ cmp -s "$TD/r1.bpf" "$TD/r2.bpf" && ok 'the same policy compiles to the same byt
 	|| bad 'the same policy compiles to the same bytes' 'files differ'
 
 # ===========================================================================
+# 11b. the generated syscall table, every name and every number
+# ===========================================================================
+# The table in seccompc.c is now generated from the kernel's asm/unistd.h, so
+# the thing worth checking is the generator, and the way to check it is per
+# name rather than per filter: name every syscall the header knows in one
+# policy, disassemble, and compare the emitted number against the number the
+# header gives for that name.
+#
+# The authority is not independent and this says so plainly. seccompc reads
+# the header through the C preprocessor at compile time; the line below reads
+# it with sed at run time. Two readers of one file. That catches a generator
+# that drops a name, pairs a name with the wrong number, or carries the x32
+# bias, which is the hazard specific to this table. It cannot catch a wrong
+# header, and nothing on this machine can.
+#
+# strace is the second authority and it IS independent: strace keeps its own
+# syscall tables, and `-e trace=` refuses a name it does not know, which was
+# checked against a made-up one.
+printf '#include <asm/unistd.h>\n' | ${CC:-gcc} -E -dM - 2>/dev/null \
+  | sed -n 's/^#define __NR_\([a-z0-9_]*\)[ \t]*\(.*\)$/\1 \2/p' \
+  | LC_ALL=C sort -u > "$TD/hdr.txt"
+nhdr=$(grep -c . "$TD/hdr.txt")
+if [ "$nhdr" -lt 300 ]; then
+	skipt 'every syscall in asm/unistd.h is nameable in a policy' 	      "read only $nhdr names out of asm/unistd.h, so the comparison would be vacuous"
+	skipt 'and every emitted number matches the header' 	      "read only $nhdr names out of asm/unistd.h"
+	skipt 'strace knows every name the table accepts' 	      "read only $nhdr names out of asm/unistd.h"
+else
+	allnames=$(cut -d' ' -f1 "$TD/hdr.txt" | paste -sd,)
+	if "$SC" -c "default=kill; allow=$allnames" -o "$TD/all.bpf" 2>"$TD/all.err"
+	then ok "every syscall in asm/unistd.h is nameable in a policy: $nhdr of them"
+	else bad "every syscall in asm/unistd.h is nameable in a policy: $nhdr of them" 	         "$(sed -n '1,3p' "$TD/all.err")"; fi
+
+	# Per field. Every jeq in the disassembly carries the name it was
+	# emitted for in its comment, so the pair can be checked both ways:
+	# the number the filter compares against, and the name it is for.
+	# The comparison is on the hex string the disassembler printed, because
+	# awk here is not gawk and has no strtonum. sprintf in the other
+	# direction needs nothing. The arch check at instruction 1 is also a
+	# jeq with a name in its comment and is the one excluded by name;
+	# leaving it in made the count 376 against 375 and is how the filter
+	# below came to be written.
+	"$SC" -d "$TD/all.bpf" 2>/dev/null \
+	  | awk '$2 == "jeq" && $8 == ";" && $9 != "AUDIT_ARCH_X86_64" \
+	         { print $9, $3 }' \
+	  | LC_ALL=C sort -u > "$TD/emit.txt"
+	_r=$(awk 'NR == FNR { want[$1] = sprintf("#0x%08x", $2 + 0); next }
+	          { got[$1] = $2 }
+	          END {
+	            miss = 0; wrong = 0
+	            for (n in want) {
+	              if (!(n in got)) { miss++; if (miss < 4) print "not emitted: " n }
+	              else if (got[n] != want[n]) {
+	                wrong++
+	                if (wrong < 4) print "number differs for " n ": header says " \
+	                    want[n] ", filter compares " got[n]
+	              }
+	            }
+	            if (miss || wrong) print miss " missing, " wrong " with the wrong number"
+	          }' "$TD/hdr.txt" "$TD/emit.txt")
+	nemit=$(grep -c . "$TD/emit.txt")
+	if [ -z "$_r" ] && [ "$nemit" -eq "$nhdr" ]; then
+		ok "and every emitted number matches the header: $nemit compared"
+	else
+		bad "and every emitted number matches the header: $nemit compared" 		    "${_r:-emitted $nemit pairs for $nhdr header names}"
+	fi
+
+	if command -v strace >/dev/null 2>&1; then
+		if strace -qq -e trace="$allnames" -o /dev/null true \
+		    > "$TD/st.txt" 2>&1
+		then ok "strace knows every name the table accepts: $nhdr of them"
+		else bad "strace knows every name the table accepts: $nhdr of them" \
+		         "$(sed -n '1,3p' "$TD/st.txt")"; fi
+	else
+		skipt 'strace knows every name the table accepts' 'strace not installed'
+	fi
+fi
+
+# ===========================================================================
 # 12. a malformed filter file is refused, never crashed on
 # ===========================================================================
 # -d reads bytes someone else wrote. Each of these exits 125 with a message on

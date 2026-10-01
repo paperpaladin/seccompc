@@ -215,59 +215,25 @@ static int print_actions(void) {
 }
 
 /*
- * Syscall names. The numbers come from the kernel's own uapi header through
- * __NR_*, so there is not one integer here to mistranscribe -- which is the
- * single bug a hand-written syscall table is famous for, and it is silent:
+ * Syscall names, generated. syscalls.h is one X(name) line per __NR_* that the
+ * kernel's own asm/unistd.h defines, and the numbers still arrive through
+ * __NR_* here, so there is not one integer in this file to mistranscribe --
+ * the single bug a hand-written syscall table is famous for, and a silent one:
  * the wrong number produces a filter that confines the wrong call.
  *
- * shortcut: a curated set, not all ~360 x86-64 syscalls. The ceiling is a
- * policy naming one that is absent; the escape hatch is that a decimal number
- * is accepted wherever a name is, so no policy is inexpressible, only
- * uglier. Upgrade path: generate the list from <asm/unistd_64.h> in the
- * Makefile, which buys completeness for the price of a generated file.
+ * This was a curated list of 177 names until the generator replaced it. A
+ * decimal number has always been accepted wherever a name is, so nothing was
+ * inexpressible, but "unknown syscall name: fchown" for a real syscall is a
+ * bad error message and it is what the other 198 produced.
+ *
+ * t/run.sh names every one of them in one policy and compares the emitted
+ * numbers against the same header read by sed, and asks strace whether it
+ * knows the names too.
  */
-#define SYSCALL_NAMES(X) \
-	X(read) X(write) X(open) X(close) X(stat) X(fstat) X(lstat) \
-	X(poll) X(lseek) X(mmap) X(mprotect) X(munmap) X(brk) \
-	X(rt_sigaction) X(rt_sigprocmask) X(rt_sigreturn) X(ioctl) \
-	X(pread64) X(pwrite64) X(readv) X(writev) X(access) X(pipe) \
-	X(select) X(sched_yield) X(mremap) X(msync) X(madvise) X(dup) \
-	X(dup2) X(nanosleep) X(getpid) X(sendfile) X(socket) X(connect) \
-	X(accept) X(sendto) X(recvfrom) X(sendmsg) X(recvmsg) X(shutdown) \
-	X(bind) X(listen) X(getsockname) X(getpeername) X(socketpair) \
-	X(setsockopt) X(getsockopt) X(clone) X(fork) X(vfork) X(execve) \
-	X(exit) X(wait4) X(kill) X(uname) X(fcntl) X(flock) X(fsync) \
-	X(ftruncate) X(getdents) X(getdents64) X(getcwd) X(chdir) \
-	X(rename) X(mkdir) X(rmdir) X(creat) X(link) X(unlink) X(symlink) \
-	X(readlink) X(chmod) X(fchmod) X(chown) X(umask) X(gettimeofday) \
-	X(getrlimit) X(setrlimit) X(getrusage) X(sysinfo) X(times) \
-	X(statfs) X(fstatfs) X(tgkill) X(getuid) X(getgid) \
-	X(setuid) X(setgid) X(geteuid) X(getegid) X(getppid) X(setsid) \
-	X(sched_setaffinity) X(sched_getaffinity) X(ptrace) X(capget) \
-	X(capset) X(sigaltstack) X(prctl) X(arch_prctl) X(chroot) \
-	X(mount) X(umount2) X(reboot) X(sethostname) X(init_module) \
-	X(delete_module) X(gettid) X(futex) X(set_tid_address) \
-	X(clock_gettime) X(clock_nanosleep) X(exit_group) X(epoll_create) \
-	X(openat) X(mkdirat) X(newfstatat) X(unlinkat) X(renameat) \
-	X(readlinkat) X(fchmodat) X(faccessat) X(pselect6) X(ppoll) \
-	X(set_robust_list) X(get_robust_list) X(splice) X(tee) \
-	X(sync_file_range) X(utimensat) X(epoll_pwait) X(signalfd) \
-	X(timerfd_create) X(eventfd) X(fallocate) X(accept4) X(dup3) \
-	X(pipe2) X(inotify_init1) X(preadv) X(pwritev) X(prlimit64) \
-	X(sendmmsg) X(getcpu) X(kcmp) X(finit_module) X(sched_setattr) \
-	X(renameat2) X(seccomp) X(getrandom) X(memfd_create) X(bpf) \
-	X(execveat) X(userfaultfd) X(membarrier) X(mlock2) \
-	X(copy_file_range) X(preadv2) X(pwritev2) X(pkey_mprotect) \
-	X(statx) X(io_uring_setup) X(io_uring_enter) X(io_uring_register) \
-	X(openat2) X(pidfd_open) X(clone3) X(close_range) X(faccessat2) \
-	X(process_madvise) X(epoll_pwait2) X(mount_setattr) X(rseq) \
-	X(landlock_create_ruleset) X(landlock_add_rule) \
-	X(landlock_restrict_self)
-
 static const struct { const char *name; int nr; } syscall_tab[] = {
-#define SC_ENTRY(n) { #n, __NR_##n },
-	SYSCALL_NAMES(SC_ENTRY)
-#undef SC_ENTRY
+#define X(n) { #n, __NR_##n },
+#include "syscalls.h"
+#undef X
 };
 #define NSYSCALL ((int)(sizeof syscall_tab / sizeof *syscall_tab))
 

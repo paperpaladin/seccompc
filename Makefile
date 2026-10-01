@@ -17,8 +17,28 @@ PCFLAGS = -std=c11 -O1 -Wall -Wextra -nostdlib -nostartfiles -static -no-pie \
 
 all: seccompc t/try t/try32 t/tryx32
 
-seccompc: seccompc.c
+seccompc: seccompc.c syscalls.h
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+# The syscall name table, from the kernel's own uapi header rather than
+# curated by hand. The curated version had 177 of the 375 names this header
+# knows, and the escape hatch for the rest was a decimal number, so no policy
+# was inexpressible, only "unknown syscall name: fchown" for a real syscall.
+#
+# LC_ALL=C on the sort is load-bearing, not caution: a locale-dependent
+# collation makes two builds of the same tree differ, which is what
+# unrepro/unrepro.py checks for across the collection.
+#
+# shortcut: no prerequisite, so the file is generated once and `make clean`
+# is what regenerates it. The ceiling is an upgrade of kernel-headers while a
+# built tree is lying around, which then keeps yesterday's names. Upgrade
+# path: ask the compiler where asm/unistd.h actually is and depend on that,
+# which is `echo '#include <asm/unistd.h>' | $(CC) -M -` and some trimming.
+syscalls.h:
+	@printf '#include <asm/unistd.h>\n' | $(CC) -E -dM - \
+	  | sed -n 's/^#define __NR_\([a-z0-9_]*\)[ \t].*/X(\1)/p' \
+	  | LC_ALL=C sort -u > $@
+	@echo "generated $@: $$(grep -c '^X(' $@) syscall names from asm/unistd.h"
 
 t/try: t/try.c
 	$(CC) $(PCFLAGS) -o $@ $<
@@ -64,7 +84,7 @@ test: all overread
 SANOPT = ASAN_OPTIONS=exitcode=86 \
 	 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:exitcode=86
 
-test-asan: t/try t/try32 t/tryx32
+test-asan: t/try t/try32 t/tryx32 syscalls.h
 	$(CC) -std=c11 -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
 		-Wall -Wextra -Wpedantic -ffile-prefix-map=$(CURDIR)=. \
 		-o seccompc-asan seccompc.c
@@ -79,7 +99,7 @@ test-asan: t/try t/try32 t/tryx32
 # exitcode=86 again, for the same reason as test-asan: `-d` can exit 0 or 125
 # by its own ordinary routes, so a number it cannot otherwise produce is the
 # only unambiguous evidence that the sanitizer, and not the program, spoke.
-overread: seccompc
+overread: seccompc syscalls.h
 	@mkdir -p t/tmp
 	@./seccompc -c 'default=kill; allow=read,write,exit_group,execve' \
 	    -o t/tmp/overread.bpf
@@ -95,7 +115,7 @@ overread: seccompc
 	      sed 's/^/      | /' t/tmp/overread.log | head -20; exit 1; fi
 
 clean:
-	rm -f seccompc seccompc-asan t/try t/try32 t/tryx32
+	rm -f seccompc seccompc-asan t/try t/try32 t/tryx32 syscalls.h
 	rm -rf t/tmp
 
 .PHONY: all test test-asan overread clean

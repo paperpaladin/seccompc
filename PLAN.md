@@ -131,12 +131,17 @@ the order of what each would cost us to get wrong.
     control/refusal pairs. This clamps our own answer downward, so it proves
     the refusal logic, not the behaviour of an old kernel: the same
     honesty gap `JAIL_ABI_MAX` has, and named as such.
-12. The sanitizer, over a buffer sized to what arrived. `make overread`
+12. The syscall table, per name. All 375 names `asm/unistd.h` knows in one
+    policy, and every number the filter compares against checked against
+    that header's number for that name. Two readers of one file: it catches
+    a broken generator, not a wrong header. strace, with its own tables, is
+    asked whether it knows the names.
+13. The sanitizer, over a buffer sized to what arrived. `make overread`
     plants a read one instruction past a filter file and fails unless ASan
     reports a heap overflow. It is a prerequisite of `make test` because it
     is the only witness to its own property: with the shrink in
     `read_filter` reverted, the suite still prints 0 failed.
-13. Disassembly round trip. The weakest oracle here, and labelled so in
+14. Disassembly round trip. The weakest oracle here, and labelled so in
     `t/run.sh` itself. Both the emitter and the disassembler are ours, so a
     shared misunderstanding passes. It exists to catch a regression in
     instruction order and establishes nothing about correctness; item 1 is what
@@ -191,7 +196,7 @@ Granularity is for `git bisect` and `git revert`, so every commit builds.
       why: the oracle needs a program that reports errno numerically and
       depends on nothing, and it needs an i386 twin, because the arch check is
       otherwise a claim, not a measurement.
-- [x] `t/run.sh`, 107 assertions, since grown to 137.
+- [x] `t/run.sh`, 107 assertions, since grown to 140.
       why: one commit, not one per group, because the groups share the
       fixtures and the skip path and splitting them would mean a dozen commits
       each adding three lines to the same file. The two harness bugs found
@@ -303,10 +308,25 @@ Granularity is for `git bisect` and `git revert`, so every commit builds.
       check that the 8-bit jump offsets still reach. Worth doing only if a
       policy ever gets large enough for `BPF_MAXINSNS` to matter, which at
       2044 rules against ~360 syscalls it cannot.
-- [ ] Generate the syscall name table from `<asm/unistd_64.h>` at build time.
-      why: the table is curated and a decimal number is the escape hatch, so
-      nothing is inexpressible, but "unknown syscall name: foo" for a real
-      syscall is a bad error message. Costs one generated file.
+- [x] Generate the syscall name table from `asm/unistd.h` at build time.
+      why: the table was curated at 177 of the 375 names this kernel's header
+      knows. A decimal number is accepted wherever a name is, so nothing was
+      inexpressible, but "unknown syscall name: fchown" for a real syscall is
+      a bad error message and that is what the other 198 produced. It cost one
+      generated file, `syscalls.h`, and the numbers still arrive through
+      `__NR_*` as before.
+      The suite checks the generator per name rather than per filter: all 375
+      names go into one policy, and every number the emitted filter compares
+      against is checked against the number `asm/unistd.h` gives for that
+      name. The authority is not independent and the suite says so, since
+      seccompc reads that header through the C preprocessor and the harness
+      reads it with sed. What it does catch, measured: dropping one name is 2
+      failures and nothing else in the suite notices; keeping 200 of 375 is
+      69; every number off by one, or carrying the x32 bias, is 53. A mangled
+      name cannot ship at all, because `__NR_fchownx` is not a macro.
+      strace is the independent half, for the names and not the numbers: it
+      keeps its own tables and `-e trace=` refuses a name it does not know,
+      which was checked against a made-up one before being relied on.
 - [ ] `SECCOMP_FILTER_FLAG_TSYNC`, so a filter installed by one thread applies
       to all of them.
       why: irrelevant to `-a`, which installs before any thread exists, and

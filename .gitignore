@@ -13,3 +13,6 @@ vgcore.*
 .cache/
 compile_commands.json
 t/tmp/
+
+# generated
+syscalls.h
