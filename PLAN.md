@@ -180,7 +180,7 @@ Granularity is for `git bisect` and `git revert`, so every commit builds.
       why: the oracle needs a program that reports errno numerically and
       depends on nothing, and it needs an i386 twin, because the arch check is
       otherwise a claim rather than a measurement.
-- [x] `t/run.sh`, 107 assertions.
+- [x] `t/run.sh`, 107 assertions, since grown to 125.
       why: one commit rather than one per group, because the groups share the
       fixtures and the skip path and splitting them would mean a dozen commits
       each adding three lines to the same file. The two harness bugs found
@@ -193,10 +193,19 @@ Granularity is for `git bisect` and `git revert`, so every commit builds.
       fixtures that were being refused for the wrong reason. The fourth is
       untestable on a kernel where every action exists, so it got a clamp
       rather than a test.
-- [x] `README.md`, then `PLAN.md`.
+- [x] The `ENOSYS`-is-routed-around assertions, three of them.
+      why: found while declining to write a README sentence without driving it.
+      `errno=ENOSYS:statx` leaves `stat(1)` working through `newfstatat` while
+      `errno=EPERM:statx` stops it, so the errno a policy chooses decides
+      whether the denial holds. That is the strongest argument in the repo
+      against treating the errno as cosmetic, and it belonged in the suite
+      before it belonged in the prose.
+- [x] `README.md`, then this file.
       why: the transcript and the "what does not work" list are a different
       artifact from the contract and the forward plan, and someone reverting
-      one rarely wants to revert the other.
+      one rarely wants to revert the other. (This file in fact landed early,
+      swept into the commit above by the gate committing the whole tree, which
+      is worth recording rather than rewriting history over.)
 
 ### Milestone 1 -- the gaps the current suite cannot close
 
