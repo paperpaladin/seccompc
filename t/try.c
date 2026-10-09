@@ -109,6 +109,12 @@ static int streq(const char *a, const char *b) {
  * effect, and cannot fail, so a nonzero exit from it is the filter and nothing
  * else. It is also x86-64 number 102, which is i386's socketcall -- the
  * collision the arch check exists to stop.
+ *
+ * shortcut: seven calls, all of them argument-free or nearly so. The ceiling is
+ * a policy worth testing against a syscall whose success is only observable
+ * through its side effects -- openat, mmap, ptrace. Upgrade path: give the
+ * table a verifier function per entry rather than widening it with arguments
+ * whose meaning the harness would then have to know.
  */
 static const struct { const char *name; long nr, a, b, c; } calls[] = {
 	{ "getuid",      __NR_getuid,      0, 0, 0 },
@@ -334,6 +340,13 @@ __asm__(".globl _start\n"
  * Exit status matches the 64-bit probe: 0 if the socket was created, otherwise
  * the errno. Unfiltered it exits 0, which is the control that stops the
  * filtered assertion from passing for some unrelated reason.
+ *
+ * shortcut: no argument parsing and one hardcoded call, where the 64-bit half
+ * has six ops and a table. The ceiling is that only this one collision can be
+ * driven through the i386 door, so a future assertion about, say, i386 nr 4
+ * (write on i386, stat on x86-64) needs code rather than a flag. Upgrade path:
+ * an i386 call table and the same argv dispatch as above, which is maybe thirty
+ * lines and buys nothing until there is a second i386 assertion to write.
  */
 #define SYS_SOCKET 1
 
