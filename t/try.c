@@ -3,6 +3,7 @@
  * kernel said, by errno, numerically.
  *
  *   try call NAME            make the call
+ *   try neg NAME             make syscall number -1 (NAME ignored)
  *   try x32 NAME             make it with the x32 bit set in rax
  *   try trap NAME            catch SIGSYS first, then make it
  *   try escape NAME          try every way out of the filter, then make it
@@ -258,7 +259,7 @@ void probe_main(long argc, char **argv) {
 	int i;
 
 	if (argc < 3) {
-		out("usage: try call|x32|trap|escape|fork NAME | try exec PROG ARGS...\n");
+		out("usage: try call|neg|x32|trap|escape|fork NAME | try exec PROG ARGS...\n");
 		xexit(2);
 	}
 	op = argv[1];
@@ -276,6 +277,12 @@ void probe_main(long argc, char **argv) {
 
 	if (streq(op, "call"))   report("call", name, do_call(i, 0));
 	if (streq(op, "x32"))    report("x32", name, do_call(i, X32_BIT));
+	/* NAME is ignored: the point is the number, not the call. nr is a
+	 * signed int in seccomp_data, so -1 reaches the filter as 0xffffffff
+	 * and is caught by the same unsigned range check as the x32 bit.
+	 * Unfiltered the kernel answers ENOSYS; under a filter it is a kill,
+	 * and that difference is deliberate. */
+	if (streq(op, "neg"))    report("neg", "nr=-1", sys3(-1, 0, 0, 0));
 	if (streq(op, "escape")) escape(i, name);
 	if (streq(op, "fork"))   forked(i, name);
 	if (streq(op, "trap")) {
