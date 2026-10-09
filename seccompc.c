@@ -127,7 +127,11 @@ static void usage(FILE *f) {
 	    "NAME is a syscall name or a decimal syscall number.\n"
 	    "ERRNO is a name such as ENOSYS or a decimal number.\n"
 	    "\n"
-	    "  %s -a 'default=kill; allow=write,exit_group,execve' -- ./prog\n",
+	    "  %s -a 'default=kill; allow=write,exit_group,execve' -- ./prog\n"
+	    "\n"
+	    "env SECCOMPC_NO_ACTION=NAME pretends the kernel lacks that action\n"
+	    "(downward only), so the refusal path can be driven on a kernel that\n"
+	    "has everything.\n",
 	    prog, prog, prog, prog, prog);
 }
 
@@ -158,8 +162,29 @@ static const struct { const char *name; unsigned long ret; } actions[] = {
 };
 #define NACTIONS ((int)(sizeof actions / sizeof *actions))
 
+static const char *action_name(uint32_t ret) {
+	for (int i = 0; i < NACTIONS; i++)
+		if ((uint32_t)actions[i].ret == (ret & SECCOMP_RET_ACTION_FULL))
+			return actions[i].name;
+	return "UNKNOWN";
+}
+
+/*
+ * SECCOMPC_NO_ACTION=NAME pretends this kernel does not implement that action.
+ * Downward only; claiming an action the kernel lacks is the exact failure the
+ * check exists to prevent.
+ *
+ * It is here because the refusal path is otherwise untestable. Every action
+ * exists on a current kernel, so the branch that matters most on an old one --
+ * refusing rather than installing a filter that will quietly do something else
+ * -- never runs where anyone is looking. jail has the same problem with old
+ * Landlock ABIs and JAIL_ABI_MAX is the same answer: make the degradation
+ * drivable, and let the kernel keep judging everything around it.
+ */
 static int action_avail(unsigned long ret) {
 	uint32_t r = (uint32_t)ret;
+	const char *no = getenv("SECCOMPC_NO_ACTION");
+	if (no && *no && !strcmp(no, action_name(r))) return 0;
 	return syscall(SYS_seccomp, SECCOMP_GET_ACTION_AVAIL, 0, &r) == 0;
 }
 
@@ -178,13 +203,6 @@ static int print_actions(void) {
 		    "(CONFIG_SECCOMP_FILTER=n, or no SYS_seccomp: %s)\n",
 		    prog, strerror(errno));
 	return ok ? 0 : 1;
-}
-
-static const char *action_name(uint32_t ret) {
-	for (int i = 0; i < NACTIONS; i++)
-		if ((uint32_t)actions[i].ret == (ret & SECCOMP_RET_ACTION_FULL))
-			return actions[i].name;
-	return "UNKNOWN";
 }
 
 /*
