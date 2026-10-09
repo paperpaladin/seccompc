@@ -391,14 +391,19 @@ static void parse_list(char *list, uint32_t act) {
 }
 
 /*
- * The policy string is kept, not freed: rule names point into it and they are
- * used in diagnostics right up to exec. A short-lived process can hold one
- * copy of its own argument.
+ * Rule names point into this buffer and are used in diagnostics right up to
+ * the exec, so it outlives parsing. It is kept in a static rather than a local
+ * so the -c path can hand it back; LeakSanitizer found the one case where that
+ * mattered, which is a policy with no rules at all -- with rules, the buffer is
+ * reachable through rules[].name and LSan calls it live.
  */
+static char *policy_buf;
+
 static void parse_policy(const char *policy) {
 	char *buf = xmalloc(strlen(policy) + 1);
 	char *save, *clause;
 	strcpy(buf, policy);
+	policy_buf = buf;
 
 	for (clause = strtok_r(buf, ";", &save); clause;
 	     clause = strtok_r(NULL, ";", &save)) {
@@ -957,7 +962,12 @@ int main(int argc, char **argv) {
 		parse_policy(argv[2]);
 		f = emit(&n);
 		write_filter(argv[4], f, n);
+		/* Only this path ever returns to the allocator. -a execs and -d
+		 * exits; here the process keeps running long enough for a leak
+		 * check to mean something, and test-asan runs one. */
 		free(f);
+		free(rules);
+		free(policy_buf);
 		return 0;
 	}
 
