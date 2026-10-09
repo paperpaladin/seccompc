@@ -260,6 +260,12 @@ static const struct { const char *name; int val; } errno_tab[] = {
 };
 #define NERRNO ((int)(sizeof errno_tab / sizeof *errno_tab))
 
+static const char *errno_name(int v) {
+	for (int i = 0; i < NERRNO; i++)
+		if (errno_tab[i].val == v) return errno_tab[i].name;
+	return NULL;
+}
+
 /* Decimal only. strtol would accept "0x10" and " 12", and a syscall number
  * that silently means something else is exactly what we are guarding
  * against. */
@@ -291,6 +297,12 @@ static int lookup_errno(const char *s) {
 		die("errno %ld out of range: the kernel clamps "
 		    "SECCOMP_RET_ERRNO data to 1..%d", v, SECCOMP_MAX_ERRNO);
 	return (int)v;
+}
+
+static const char *syscall_name(int nr) {
+	for (int i = 0; i < NSYSCALL; i++)
+		if (syscall_tab[i].nr == nr) return syscall_tab[i].name;
+	return NULL;
 }
 
 static int lookup_syscall(const char *s) {
@@ -528,6 +540,295 @@ static void write_filter(const char *path, const struct sock_filter *f, int n) {
 	if (fclose(fp) != 0) die("%s: %s", path, strerror(errno));
 }
 
+/* ------------------------------------------------------------ disasm ----- */
+
+#define SD_SIZE ((uint32_t)sizeof(struct seccomp_data))
+
+/* Which seccomp_data field an absolute load is reading. The 64-bit fields are
+ * two 32-bit loads, because classic BPF has no 64-bit load, which is why a
+ * filter inspecting an argument has to compare both halves and why filtering
+ * on a pointer argument is useless (the pointer is read, not the memory). */
+static const char *sd_field(uint32_t k, char *buf, size_t bufsz) {
+	switch (k) {
+	case 0:  return "seccomp_data.nr";
+	case 4:  return "seccomp_data.arch";
+	case 8:  return "seccomp_data.instruction_pointer low";
+	case 12: return "seccomp_data.instruction_pointer high";
+	default:
+		if (k >= 16 && k + 4 <= SD_SIZE) {
+			snprintf(buf, bufsz, "seccomp_data.args[%u] %s",
+			    (k - 16) / 8, ((k - 16) % 8) ? "high" : "low");
+			return buf;
+		}
+		return NULL;
+	}
+}
+
+static const char *ret_desc(uint32_t k, char *buf, size_t bufsz) {
+	if ((k & SECCOMP_RET_ACTION_FULL) == SECCOMP_RET_ERRNO) {
+		int e = (int)(k & SECCOMP_RET_DATA);
+		const char *n = errno_name(e);
+		if (n) snprintf(buf, bufsz, "errno %d (%s)", e, n);
+		else   snprintf(buf, bufsz, "errno %d", e);
+		return buf;
+	}
+	return action_name(k);
+}
+
+static const char *alu_op(uint16_t code) {
+	switch (BPF_OP(code)) {
+	case BPF_ADD: return "add";
+	case BPF_SUB: return "sub";
+	case BPF_MUL: return "mul";
+	case BPF_DIV: return "div";
+	case BPF_OR:  return "or";
+	case BPF_AND: return "and";
+	case BPF_LSH: return "lsh";
+	case BPF_RSH: return "rsh";
+	case BPF_NEG: return "neg";
+	case BPF_MOD: return "mod";
+	case BPF_XOR: return "xor";
+	default: return NULL;
+	}
+}
+
+static const char *jmp_op(uint16_t code) {
+	switch (BPF_OP(code)) {
+	case BPF_JA:   return "ja";
+	case BPF_JEQ:  return "jeq";
+	case BPF_JGT:  return "jgt";
+	case BPF_JGE:  return "jge";
+	case BPF_JSET: return "jset";
+	default: return NULL;
+	}
+}
+
+static const char *size_sfx(uint16_t code) {
+	switch (BPF_SIZE(code)) {
+	case BPF_W: return "";
+	case BPF_H: return "h";
+	case BPF_B: return "b";
+	default: return NULL;
+	}
+}
+
+/*
+ * Disassemble, and report every structural problem found, to stderr. Returns
+ * the number of problems; `-d` exits 125 if that is nonzero.
+ *
+ * The disassembly is printed even for a broken program, because the first
+ * thing anyone wants on being told "instruction 11 jumps past the end" is to
+ * look at instruction 11. Nothing here indexes past `n`, which is the point of
+ * the malformed-input tests and of running them under ASan.
+ *
+ * shortcut: this validator is ours and is NOT checked against the kernel's own
+ * bpf_check_classic(). The ceiling is a filter the kernel would refuse and we
+ * accept, or the reverse; we only ever observe the first kind, and only
+ * indirectly, when installing a filter we emitted fails. Upgrade path: a probe
+ * mode that loads a filter file in a forked child and reports the kernel's
+ * errno, which would turn "ours agrees with the kernel" into an assertion.
+ */
+static int disasm(const struct sock_filter *f, int n) {
+	int bad = 0;
+	uint32_t lastld = 0xffffffffU;  /* offset of the last absolute load */
+	char opbuf[64], nbuf[64];
+
+	for (int i = 0; i < n; i++) {
+		const struct sock_filter *p = &f[i];
+		const char *note = NULL, *op;
+		int jt = -1, jf = -1;
+
+		switch (BPF_CLASS(p->code)) {
+		case BPF_LD:
+		case BPF_LDX: {
+			const char *x = BPF_CLASS(p->code) == BPF_LDX ? "x" : "";
+			const char *sz = size_sfx(p->code);
+			if (!sz) goto unknown;
+			switch (BPF_MODE(p->code)) {
+			case BPF_IMM:
+				snprintf(opbuf, sizeof opbuf, "ld%s%s #0x%08x",
+				    x, sz, p->k);
+				break;
+			case BPF_ABS:
+				snprintf(opbuf, sizeof opbuf, "ld%s%s [%u]",
+				    x, sz, p->k);
+				note = sd_field(p->k, nbuf, sizeof nbuf);
+				if (!note) {
+					fprintf(stderr, "%s: %04d: absolute load "
+					    "at %u is outside seccomp_data "
+					    "(%u bytes)\n", prog, i, p->k, SD_SIZE);
+					bad++;
+				} else if (BPF_SIZE(p->code) == BPF_W) {
+					lastld = p->k;
+				}
+				break;
+			case BPF_IND:
+				snprintf(opbuf, sizeof opbuf, "ld%s%s [x + %u]",
+				    x, sz, p->k);
+				break;
+			case BPF_MEM:
+				snprintf(opbuf, sizeof opbuf, "ld%s%s M[%u]",
+				    x, sz, p->k);
+				if (p->k >= BPF_MEMWORDS) {
+					fprintf(stderr, "%s: %04d: scratch slot "
+					    "%u, only %d exist\n", prog, i,
+					    p->k, BPF_MEMWORDS);
+					bad++;
+				}
+				break;
+			case BPF_LEN:
+				snprintf(opbuf, sizeof opbuf, "ld%s%s len", x, sz);
+				break;
+			case BPF_MSH:
+				snprintf(opbuf, sizeof opbuf, "ld%s%s 4*([%u]&0xf)",
+				    x, sz, p->k);
+				break;
+			default:
+				goto unknown;
+			}
+			break;
+		}
+		case BPF_ST:
+		case BPF_STX:
+			snprintf(opbuf, sizeof opbuf, "st%s M[%u]",
+			    BPF_CLASS(p->code) == BPF_STX ? "x" : "", p->k);
+			if (p->k >= BPF_MEMWORDS) {
+				fprintf(stderr, "%s: %04d: scratch slot %u, only "
+				    "%d exist\n", prog, i, p->k, BPF_MEMWORDS);
+				bad++;
+			}
+			break;
+		case BPF_ALU:
+			op = alu_op(p->code);
+			if (!op) goto unknown;
+			if (BPF_OP(p->code) == BPF_NEG)
+				snprintf(opbuf, sizeof opbuf, "neg");
+			else if (BPF_SRC(p->code) == BPF_X)
+				snprintf(opbuf, sizeof opbuf, "%s x", op);
+			else
+				snprintf(opbuf, sizeof opbuf, "%s #0x%08x", op, p->k);
+			/* The kernel refuses these outright rather than
+			 * trapping at runtime, so they are errors, not notes. */
+			if (BPF_SRC(p->code) == BPF_K && p->k == 0 &&
+			    (BPF_OP(p->code) == BPF_DIV || BPF_OP(p->code) == BPF_MOD)) {
+				fprintf(stderr, "%s: %04d: %s by the constant 0\n",
+				    prog, i, op);
+				bad++;
+			}
+			break;
+		case BPF_JMP:
+			op = jmp_op(p->code);
+			if (!op) goto unknown;
+			if (BPF_OP(p->code) == BPF_JA) {
+				long t = (long)i + 1 + p->k;
+				snprintf(opbuf, sizeof opbuf, "ja %04ld", t);
+				if (t >= n) {
+					fprintf(stderr, "%s: %04d: ja to %ld, "
+					    "past the last instruction (%d)\n",
+					    prog, i, t, n - 1);
+					bad++;
+				}
+			} else {
+				jt = i + 1 + p->jt;
+				jf = i + 1 + p->jf;
+				if (BPF_SRC(p->code) == BPF_X)
+					snprintf(opbuf, sizeof opbuf, "%s x", op);
+				else
+					snprintf(opbuf, sizeof opbuf, "%s #0x%08x",
+					    op, p->k);
+				if (jt >= n || jf >= n) {
+					fprintf(stderr, "%s: %04d: jump to %d/%d, "
+					    "past the last instruction (%d)\n",
+					    prog, i, jt, jf, n - 1);
+					bad++;
+				}
+				if (BPF_SRC(p->code) == BPF_K) {
+					if (p->k == AUDIT_ARCH_X86_64)
+						note = "AUDIT_ARCH_X86_64";
+					else if (p->k == (uint32_t)(__X32_SYSCALL_BIT - 1))
+						note = "x32 bit, or a negative nr";
+					else if (lastld == 0)
+						note = syscall_name((int)p->k);
+				}
+			}
+			break;
+		case BPF_RET:
+			if (BPF_RVAL(p->code) == BPF_K) {
+				snprintf(opbuf, sizeof opbuf, "ret #0x%08x", p->k);
+				note = ret_desc(p->k, nbuf, sizeof nbuf);
+			} else if (BPF_RVAL(p->code) == BPF_A) {
+				snprintf(opbuf, sizeof opbuf, "ret a");
+			} else {
+				goto unknown;
+			}
+			break;
+		case BPF_MISC:
+			if (BPF_MISCOP(p->code) == BPF_TAX)
+				snprintf(opbuf, sizeof opbuf, "tax");
+			else if (BPF_MISCOP(p->code) == BPF_TXA)
+				snprintf(opbuf, sizeof opbuf, "txa");
+			else
+				goto unknown;
+			break;
+		default:
+		unknown:
+			snprintf(opbuf, sizeof opbuf, ".word 0x%04x", p->code);
+			fprintf(stderr, "%s: %04d: not a valid classic-BPF "
+			    "opcode: 0x%04x\n", prog, i, p->code);
+			bad++;
+			break;
+		}
+
+		printf("%04d  %-26s", i, opbuf);
+		if (jt >= 0) printf("  jt %04d jf %04d", jt, jf);
+		else         printf("                 ");
+		if (note) printf("  ; %s", note);
+		putchar('\n');
+	}
+
+	/*
+	 * The kernel requires the last instruction to be a return, because
+	 * falling off the end has no defined verdict. A filter that ends in a
+	 * comparison is the shape a truncated file takes.
+	 */
+	if (BPF_CLASS(f[n - 1].code) != BPF_RET) {
+		fprintf(stderr, "%s: %04d: program does not end with a return\n",
+		    prog, n - 1);
+		bad++;
+	}
+	return bad;
+}
+
+/*
+ * Read a filter file. The cap is one instruction past BPF_MAXINSNS so that
+ * "too long" is distinguishable from "exactly at the limit" without reading an
+ * unbounded file into memory, and every later check works on the byte count we
+ * actually got rather than on anything the file claims about itself.
+ */
+static struct sock_filter *read_filter(const char *path, int *out_n) {
+	size_t isz = sizeof(struct sock_filter);
+	size_t cap = ((size_t)BPF_MAXINSNS + 1) * isz;
+	struct sock_filter *f = xmalloc(cap);
+	FILE *fp = fopen(path, "rb");
+	size_t got;
+
+	if (!fp) die("%s: %s", path, strerror(errno));
+	got = fread(f, 1, cap, fp);
+	if (ferror(fp)) die("%s: %s", path, strerror(errno));
+	fclose(fp);
+
+	if (got == 0)
+		die("%s: no instructions; an empty filter has no verdict", path);
+	if (got % isz)
+		die("%s: %zu bytes is not a whole number of %zu-byte "
+		    "instructions (truncated?)", path, got, isz);
+	if (got / isz > BPF_MAXINSNS)
+		die("%s: more than the kernel's limit of %d instructions",
+		    path, BPF_MAXINSNS);
+	*out_n = (int)(got / isz);
+	return f;
+}
+
 int main(int argc, char **argv) {
 	if (argv[0]) prog = argv[0];
 
@@ -546,6 +847,19 @@ int main(int argc, char **argv) {
 		f = emit(&n);
 		write_filter(argv[4], f, n);
 		free(f);
+		return 0;
+	}
+
+	if (argc >= 2 && !strcmp(argv[1], "-d")) {
+		struct sock_filter *f;
+		int n, bad;
+		if (argc != 3) die("usage: %s -d FILE", prog);
+		f = read_filter(argv[2], &n);
+		bad = disasm(f, n);
+		free(f);
+		if (bad)
+			die("%s: %d problem%s; this is not a filter the kernel "
+			    "would accept", argv[2], bad, bad == 1 ? "" : "s");
 		return 0;
 	}
 
