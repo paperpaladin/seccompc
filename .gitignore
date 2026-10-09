@@ -1,0 +1,14 @@
+# build outputs
+seccompc
+seccompc-asan
+t/try
+t/try32
+
+# editor / tooling debris
+*.o
+*.core
+core
+vgcore.*
+.cache/
+compile_commands.json
+t/tmp/
