@@ -76,6 +76,32 @@ if [ -z "$avail" ]; then
 	printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"
 	exit 0
 fi
+# Which actions THIS kernel has. The suite skips loudly when seccomp is
+# absent entirely, but every assertion below used to assume that a kernel with
+# seccomp has all eight actions. It does not: SECCOMP_RET_LOG and
+# SECCOMP_RET_KILL_PROCESS arrived in 4.14 and user_notif in 5.0, so on a
+# kernel between 3.5 and 4.14 the log assertions would have reported a
+# seccompc bug where there is only an older kernel. The matrix loop below even
+# says "Every action exists on this kernel" -- which was an assumption, and is
+# now a question with an answer.
+has_action() {
+	case " $avail " in *" $1 "*) return 0 ;; esac
+	return 1
+}
+
+# A handful of assertions use default=kill (SECCOMP_RET_KILL_PROCESS) as the
+# backdrop for testing something else -- the arch check, the -c/-d round trip,
+# exec's 126 and 127. kill_process is 4.14 and newer, so on an older kernel
+# those would fail for a reason that has nothing to do with what they assert.
+# Say so once, loudly, rather than pretending or guarding seventeen sites.
+if ! has_action kill_process; then
+	echo "NOTE: this kernel has no kill_process action (it is 4.14 and newer)."
+	echo "Assertions that use default=kill as a backdrop will fail here for"
+	echo "that reason alone. The action matrix below uses kill_thread instead."
+fi
+# The matrix needs a deny-by-default action that this kernel really has.
+if has_action kill_process; then MATRIX_DENY=kill; else MATRIX_DENY=kill_thread; fi
+
 echo "seccomp actions: $avail"
 echo "on $(uname -r), filter binary $SC"
 echo
@@ -154,8 +180,12 @@ t 'default=kill: allowed still runs'  0 -- $TO "$SC" \
     -a "default=kill; allow=$BASE,getuid" -- "$TRY" call getuid
 t 'kill= clause: dies of SIGSYS'    159 -- $TO "$SC" \
     -a "default=allow; kill=socket" -- "$TRY" call socket
+if has_action kill_thread; then
 t 'kill_thread= clause: SIGSYS'     159 -- $TO "$SC" \
     -a "default=allow; kill_thread=socket" -- "$TRY" call socket
+else
+skipt 'kill_thread= clause: SIGSYS' "kernel has no kill_thread action"
+fi
 # kill_process and kill_thread differ only in how much of a multi-threaded
 # process they take down. The probe has one thread, so this suite cannot tell
 # them apart, and says so rather than inventing an assertion.
@@ -179,10 +209,18 @@ t 'kill is not catchable'           159 -- $TO "$SC" -a "$P_KILLH" -- "$TRY" tra
 # ===========================================================================
 # 5. log allows the call; it is not a quiet denial
 # ===========================================================================
+if has_action log; then
 t 'log= lets the call through'        0 -- $TO "$SC" \
     -a "default=errno:ENOSYS; allow=$BASE; log=socket" -- "$TRY" call socket
+else
+skipt 'log= lets the call through' "kernel has no log action"
+fi
+if has_action log; then
 t 'default=log lets everything through' 0 -- $TO "$SC" \
     -a "default=log" -- "$TRY" call socket
+else
+skipt 'default=log lets everything through' "kernel has no log action"
+fi
 
 # ===========================================================================
 # 6. strace as an independent witness
@@ -583,20 +621,28 @@ t 'whitespace and a trailing ; are fine'  0 -- $TO "$SC" \
 # The kernel does NOT reject a filter returning an action it does not know: it
 # treats the value as the lowest action it recognises, KILL_THREAD. So a policy
 # asking for kill_process on a 4.13 kernel would install and do something else.
-# Every action exists on this kernel, so SECCOMPC_NO_ACTION drives the refusal
-# the way jail's JAIL_ABI_MAX drives its degradation -- downward only.
+# SECCOMPC_NO_ACTION drives the refusal the way jail's JAIL_ABI_MAX drives its
+# degradation -- downward only. The control half needs the action to really be
+# there, so it is asked for rather than assumed; this comment used to assert
+# "Every action exists on this kernel", which is true here and was never
+# checked.
 for a in kill_process kill_thread trap errno log allow; do
 	case $a in
 	kill_process) pol='default=kill' ;;
 	kill_thread)  pol='default=kill_thread' ;;
-	trap)         pol='default=kill; trap=read' ;;
-	errno)        pol='default=kill; errno=EPERM:read' ;;
-	log)          pol='default=kill; log=read' ;;
-	allow)        pol='default=kill; allow=read' ;;
+	trap)         pol="default=$MATRIX_DENY; trap=read" ;;
+	errno)        pol="default=$MATRIX_DENY; errno=EPERM:read" ;;
+	log)          pol="default=$MATRIX_DENY; log=read" ;;
+	allow)        pol="default=$MATRIX_DENY; allow=read" ;;
 	esac
 	# Without the clamp it compiles; with it, it is refused. The pair is what
-	# shows the refusal is about availability and not about the policy.
-	t "control: $a compiles when available"  0 -- "$SC" -c "$pol" -o "$TD/z"
+	# shows the refusal is about availability and not about the policy -- so
+	# the control is only meaningful where the kernel really has the action.
+	if has_action "$a"; then
+		t "control: $a compiles when available"  0 -- "$SC" -c "$pol" -o "$TD/z"
+	else
+		skipt "control: $a compiles when available" "kernel has no $a action"
+	fi
 	t "a missing $a action is refused"     125 -- env "SECCOMPC_NO_ACTION=$a" \
 	    "$SC" -c "$pol" -o "$TD/z"
 done
