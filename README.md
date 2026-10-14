@@ -54,7 +54,7 @@ seccompc -a 'default=errno:ENOSYS; allow=execve,write,exit_group;
 ```
 
 The policy **must allow `execve`**, and seccompc refuses to run if it does not.
-See "what does not work" -- it is structural, not an oversight.
+See "what does not work". It is structural.
 
 ## What it emits
 
@@ -84,7 +84,7 @@ $ seccompc -d f.bpf
 ## The one line that matters
 
 Instructions 0 to 2 are the whole security of this program, and a seccomp
-filter without them is broken rather than merely sloppy.
+filter without them is broken, not merely sloppy.
 
 `seccomp_data.nr` is an index into the syscall table of whichever entry point
 the process used, and an x86-64 kernel keeps three of those. The tables
@@ -99,13 +99,13 @@ disagree:
 `socketcall` is the i386 multiplexer through which `socket`, `bind`, `connect`
 and the rest are reached. So a filter that compares `nr` without first pinning
 `arch`, and which permits `getuid`, has thereby permitted **any 32-bit caller
-to open a socket** -- using nothing more exotic than `int $0x80` with
+to open a socket**, using nothing more exotic than `int $0x80` with
 `eax=102`.
 
 That is not a story here. `t/try32` is built from the same source with `-m32`
 and does exactly that call. Unfiltered it gets a socket; under
 `default=errno:ENOSYS; allow=...,getuid` it dies of `SIGSYS`. Change the arch
-comparison's `jf` from 0 to 1 -- the one-byte version of forgetting the check --
+comparison's `jf` from 0 to 1: the one-byte version of forgetting the check,
 and the same probe exits 0 with a socket in hand.
 
 Instruction 4 exists because pinning `arch` is necessary and **not sufficient**,
@@ -118,15 +118,15 @@ syscall number at the same time. Both are driven by the suite.
 ## The oracle
 
 The kernel is the authority. No mock, no stub, and nothing in the suite that
-inspects seccompc's internals -- with one labelled exception, below.
+inspects seccompc's internals, with one labelled exception, below.
 
 Every assertion is a real process making a real syscall under a real filter,
-and the thing asserted is the kernel's verdict. `t/try` is a **freestanding**
+and the thing asserted is the kernel's verdict. `t/try` is a freestanding
 probe: no libc, no dynamic loader, its own `_start`, every syscall through
 inline asm with the kernel's negative-errno return handed straight to the exit
 status. That is not minimalism for its own sake. A probe linked against glibc
-drags in a startup sequence -- `brk`, `arch_prctl`, `set_tid_address`,
-`set_robust_list`, `rseq`, `mmap` -- which every test policy would then have to
+drags in a startup sequence: `brk`, `arch_prctl`, `set_tid_address`,
+`set_robust_list`, `rseq`, `mmap`, which every test policy would then have to
 allow, so "the allowed syscalls still work" would be partly an accident of a
 broad allowlist, and a glibc upgrade could change the set under the suite
 without anyone touching it. Here the only syscalls that occur are `write`,
@@ -134,26 +134,26 @@ without anyone touching it. Here the only syscalls that occur are `write`,
 
 Ranked by how little we control them:
 
-1. **The 32-bit entry point, driven for real.** Four assertions, two of them
+1. The 32-bit entry point, driven for real. Four assertions, two of them
    controls, because without them the test would pass for a `-m32` binary that
    could not run at all, or for a policy that denied 102 outright.
-2. **The filtered process cannot get out.** Four attempts, then the denied
+2. The filtered process cannot get out. Four attempts, then the denied
    syscall again. The transcript is asserted to show the permissive
    self-install *succeeding*, or this group would pass for the wrong reason.
-3. **The exact errno, not merely failure.** `socket(AF_INET, SOCK_STREAM)`
+3. The exact errno, not merely failure. `socket(AF_INET, SOCK_STREAM)`
    cannot fail on this machine, so any errno seen is the filter's.
-4. **`kill` / `trap` / `log` are the mechanisms claimed.** `kill` is wait
+4. `kill` / `trap` / `log` are the mechanisms claimed. `kill` is wait
    status 159 and is *not* caught by a handler that does catch `trap`.
-5. **`strace` as an independent witness.** Where strace and this program
+5. `strace` as an independent witness. Where strace and this program
    disagree, this program is wrong.
-6. **Allowed syscalls still work**, and strace counts the syscalls actually
+6. Allowed syscalls still work, and strace counts the syscalls actually
    executed under a filter, which must exceed ten.
-7. **Inheritance** by fork, by exec, and by a grandchild.
-8. **Transparency**, through a real dynamically linked program.
-9. **Malformed filter files**, twelve refusals, each also under ASan+UBSan.
-10. **`--actions` against `/proc/sys/kernel/seccomp/actions_avail`.**
-11. **Disassembly round trip -- the weakest oracle here, and labelled so in
-    `t/run.sh` itself.** Both the emitter and the disassembler are ours, so a
+7. Inheritance by fork, by exec, and by a grandchild.
+8. Transparency, through a real dynamically linked program.
+9. Malformed filter files, twelve refusals, each also under ASan+UBSan.
+10. `--actions` against `/proc/sys/kernel/seccomp/actions_avail`.
+11. Disassembly round trip: the weakest oracle here, and labelled so in
+    `t/run.sh` itself. Both the emitter and the disassembler are ours, so a
     shared misunderstanding passes. It catches regressions in instruction
     order and establishes nothing about correctness; item 1 is what does that.
 
@@ -300,16 +300,16 @@ Ranked by how little we control them:
 ```
 
 The escape transcript is the interesting one. Clearing `no_new_privs` is
-`EINVAL` -- it is one-way. `PR_SET_SECCOMP` with `SECCOMP_MODE_DISABLED` is
-`EINVAL`; there is no way to turn a filter off. And installing a maximally
-permissive filter of its own **succeeds**, and changes nothing: filters do not
+`EINVAL`. It is one-way. `PR_SET_SECCOMP` with `SECCOMP_MODE_DISABLED` is
+`EINVAL`. There is no way to turn a filter off. And installing a maximally
+permissive filter of its own succeeds, and changes nothing: filters do not
 replace each other, they accumulate. Every filter in the task's list runs on
 every syscall and the most restrictive answer wins. There is no
 `seccomp_release()`, by design. The policy for that test deliberately allows
 `prctl` and `seccomp` so the attempts are really made.
 
 If seccomp filtering is unavailable the harness prints the kernel version and
-the two likely reasons and reports every assertion as **skipped**. If there is
+the two likely reasons and reports every assertion as skipped. If there is
 no `-m32` toolchain the four i386 assertions skip loudly and say why. A skip is
 never dressed up as a pass.
 
@@ -348,27 +348,27 @@ twenty-six caught by a named assertion:
 | availability check gutted entirely | 7 |
 | **`SECCOMP_GET_ACTION_AVAIL` query replaced by `return 1`** | **nothing** |
 
-The one survivor is recorded rather than patched, because on this kernel it is
-**provably equivalent**: all eight seccomp actions are available -- a fact the
-suite asserts against `/proc/sys/kernel/seccomp/actions_avail` -- so asking the
+The one survivor is recorded, not patched, because on this kernel it is
+provably equivalent: all eight seccomp actions are available: a fact the
+suite asserts against `/proc/sys/kernel/seccomp/actions_avail`, so asking the
 kernel and answering "yes" are the same function here. Only a kernel missing an
 action could tell them apart, and `SECCOMPC_NO_ACTION` drives the surrounding
 logic instead.
 
-Three mutations are caught **only** by the structural check, which is the
+Three mutations are caught only by the structural check, which is the
 weakest oracle in the suite, and all three are observationally identical to a
 single-threaded probe making real syscalls: `jgt` -> `jge` differs only at
 `nr == 0x3fffffff`, which is not a syscall; `KILL_THREAD` and `KILL_PROCESS`
-are the same death for a process with one thread; and swapped `jt`/`jf` in the
+are the same death for a process with one thread, and swapped `jt`/`jf` in the
 disassembler changes no filter. The structural check earning its place on those
 three is the argument for keeping it, and the reason it is still ranked last.
 
 Four mutations survived the first sweep and three of them were real holes, all
-of the same shape -- **a fixture that was being refused for the wrong reason**:
+of the same shape, a fixture that was being refused for the wrong reason:
 
 - `reject: truncated instruction` used the first 12 bytes of a valid filter.
   Delete the size check and 12/8 truncates to one instruction, that instruction
-  is a load rather than a return, and the file is still refused -- by a
+  is a load, not a return, and the file is still refused, by a
   different check. The fixture is now a complete program plus four stray bytes.
   The sanitizer run caught that mutation anyway, by a route nobody designed:
   with the check gone a one-byte file yields zero instructions and the
@@ -378,14 +378,12 @@ of the same shape -- **a fixture that was being refused for the wrong reason**:
   check left the other to refuse it.
 - Both 126/127 assertions used `default=allow`, where `write` is permitted, so
   deleting the PATH preflight was invisible. The preflight exists precisely for
-  the policy that denies `write`; there are now assertions under
+  the policy that denies `write`. There are now assertions under
   `default=kill`.
 
-## Status
+## What works
 
-### What works
-
-- `-a POLICY -- CMD` installs the filter and execs CMD. Inherited by every
+- `-a POLICY: CMD` installs the filter and execs CMD. Inherited by every
   descendant across `fork` and `exec`, forever, and irrevocable.
 - Six clause kinds and seven actions, with the action validated against the
   running kernel before anything is installed.
@@ -402,21 +400,21 @@ of the same shape -- **a fixture that was being refused for the wrong reason**:
   refuse.
 - A decimal syscall number works anywhere a name does.
 
-### What does not work
+## What does not work
 
 Honestly, and this list is longer than the one above. Twenty-one entries,
 every one either measured here or named as untested.
 
-- **`execve` cannot be denied to CMD.** The filter must be installed before the
+- `execve` cannot be denied to CMD. The filter must be installed before the
   exec that starts CMD, because a process cannot install a filter on a process
   it is not. So the policy has to permit `execve`, and since the filter is one
   domain shared by the whole tree, CMD and all its children can exec too.
-  seccompc refuses a policy that denies `execve` rather than adding it
+  seccompc refuses a policy that denies `execve` instead of adding it
   silently, which is what systemd's `SystemCallFilter` does. The honest fix is
-  a trampoline -- permit exec only from a specific `instruction_pointer`, or
-  `SECCOMP_RET_TRACE` with a supervisor allowing exactly one -- and both are
+  a trampoline, permit exec only from a specific `instruction_pointer`, or
+  `SECCOMP_RET_TRACE` with a supervisor allowing exactly one, and both are
   larger than this program.
-- **The errno you choose changes whether the denial works.** `ENOSYS` is the
+- The errno you choose changes whether the denial works. `ENOSYS` is the
   errno libc fallback paths look for: glibc probes a newer syscall and retries
   an older one on `ENOSYS`. Measured, not guessed:
 
@@ -427,86 +425,86 @@ every one either measured here or named as untested.
 
   The second is glibc falling back to `newfstatat`, which strace shows
   directly. The same applies to `clone3` -> `clone` and `faccessat2` ->
-  `faccessat`. Naming every door closes it; there is no way for seccompc to
+  `faccessat`. Naming every door closes it. There is no way for seccompc to
   know what the doors are.
-- **Collateral damage is normal and lands far from the syscall named.**
+- Collateral damage is normal and lands far from the syscall named.
   `errno=ENOSYS:newfstatat` makes `sh -c 'stat ...'` report
   `stat: Function not implemented` from the *shell*, because dash resolves a
   PATH lookup with `newfstatat` and so cannot find `stat(1)` at all. That is
-  not a bug here; it is what filtering a syscall used by everything looks like.
-- **No argument filtering, and this is permanent.** Classic BPF can compare the
-  six `args[]` words, so `open` with a particular flag is expressible -- but a
+  not a bug here. It is what filtering a syscall used by everything looks like.
+- No argument filtering, and this is permanent. Classic BPF can compare the
+  six `args[]` words, so `open` with a particular flag is expressible, but a
   pointer argument is only the pointer. The filter cannot read the memory it
   names, and userspace can change that memory after the check and before the
   kernel reads it. Offering `arg0==N` would invite exactly that race, so the
-  answer is no rather than later.
-- **A policy names syscalls, not libc functions, and the two diverge.**
+  answer is no.
+- A policy names syscalls, not libc functions, and the two diverge.
   `chmod(1)` does not use the `chmod(2)` syscall; glibc routes it through
   `fchmodat(2)`, so `errno=EPERM:chmod` changes nothing. The suite asserts
   that, with the reason, because it is the most likely way for a real policy to
   be full of holes. `strace` is the only reliable way to find out what a
   program actually calls.
-- **x86-64 only.** `AUDIT_ARCH_X86_64` is one constant in `emit()` and
+- x86-64 only. `AUDIT_ARCH_X86_64` is one constant in `emit()` and
   everything else arrives at a kill. A legitimately 32-bit child process dies
   of `SIGSYS` under any policy, including `default=allow`. That is the safe
   direction and still a surprise.
-- **Out-of-range syscall numbers are killed rather than passed through.**
-  `syscall(-1)` normally returns `ENOSYS`; under any seccompc filter it is a
+- Out-of-range syscall numbers are killed, not passed through.
+  `syscall(-1)` normally returns `ENOSYS`. Under any seccompc filter it is a
   kill. The transparency claim is scoped to syscalls the policy can name.
-- **`-a` cannot install a filter from a file.** `-c` output is for inspection,
+- `-a` cannot install a filter from a file. `-c` output is for inspection,
   diffing and feeding to some other program; `-a` recompiles from the policy.
   So `-c` plus `-d` is a loop that never reaches the kernel, which is exactly
   why the round trip is ranked last as an oracle.
-- **The `-d` validator has no external authority.** It is ours, and it is not
+- The `-d` validator has no external authority. It is ours, and it is not
   checked against the kernel's `bpf_check_classic()`. A filter we accept and
   the kernel refuses shows up only indirectly, as an install failure on a
-  filter we emitted ourselves; a filter we *refuse* and the kernel would accept
+  filter we emitted ourselves. A filter we *refuse* and the kernel would accept
   is invisible. The fix is a probe mode that loads a filter file in a forked
   child and reports the kernel's errno, and it is item 1 in `PLAN.md`.
-- **`-d` is a seccomp disassembler, not a BPF one.** It refuses an absolute
+- `-d` is a seccomp disassembler, not a BPF one. It refuses an absolute
   load outside the 64 bytes of `seccomp_data`, because the kernel does, so it
   is useless for socket filters.
-- **x32 is driven by reconstruction, not by an x32 binary.** The 64-bit probe
+- x32 is driven by reconstruction, not by an x32 binary. The 64-bit probe
   sets bit 30 in `rax`, which is what seccomp sees either way, so the assertion
-  is sound -- but it is not the x32 entry path itself. That needs
+  is sound, but it is not the x32 entry path itself. That needs
   `CONFIG_X86_X32_ABI` and an x32 toolchain.
-- **`kill_process` and `kill_thread` are not distinguished.** They differ only
+- `kill_process` and `kill_thread` are not distinguished. They differ only
   in how much of a multi-threaded process they take down, the probe has one
-  thread, and the suite reports that as a **skip** rather than inventing an
+  thread, and the suite reports that as a skip instead of inventing an
   assertion.
-- **`log=` is asserted to allow the call, not to log it.** The other half needs
+- `log=` is asserted to allow the call, not to log it. The other half needs
   `/proc/sys/kernel/seccomp/actions_logged` and a readable audit sink, neither
   guaranteed. The filter is also installed with flags 0, so there is no
   `SECCOMP_FILTER_FLAG_LOG`.
-- **The missing-action refusal is tested by clamping our own answer.**
+- The missing-action refusal is tested by clamping our own answer.
   `SECCOMPC_NO_ACTION=NAME` proves the refusal logic, on the real kernel,
   through real syscalls. It does not prove the behaviour of a 4.13 kernel,
   which nothing short of a 4.13 kernel can. Same honesty gap as jail's
   `JAIL_ABI_MAX`, and named the same way.
-- **The syscall and errno name tables are curated**, 177 and 30 entries.
-  A decimal number works anywhere a name does, so nothing is inexpressible --
+- The syscall and errno name tables are curated, 177 and 30 entries.
+  A decimal number works anywhere a name does, so nothing is inexpressible,
   but `unknown syscall name: foo` for a real syscall is a bad error message.
   Generating the list from `<asm/unistd_64.h>` costs one generated file.
-- **An errno of 0 is refused**, so "pretend the call succeeded and did nothing"
-  is not expressible. It is a real technique; it is also a way to make a policy
+- An errno of 0 is refused, so "pretend the call succeeded and did nothing"
+  is not expressible. It is a real technique. It is also a way to make a policy
   lie to the program it is confining by accident.
-- **The PATH preflight is `access(X_OK)`**, so a command unlinked between the
+- The PATH preflight is `access(X_OK)`, so a command unlinked between the
   check and the exec still lands in the case the preflight exists to avoid: the
   exec fails, seccompc tries to say so, the `write` is denied, and the caller
   sees 159 with no message. `execveat()` on an `O_PATH` descriptor would close
   it.
-- **No `SECCOMP_RET_USER_NOTIF` and no `SECCOMP_RET_TRACE`.** Both need a
+- No `SECCOMP_RET_USER_NOTIF` and no `SECCOMP_RET_TRACE`. Both need a
   supervisor process, which is a different program.
-- **No `SECCOMP_FILTER_FLAG_TSYNC`.** Irrelevant to `-a`, which installs before
-  any thread exists; essential the moment this is used as a library.
-- **A killed process dumps core by default.** seccompc does not change
-  `RLIMIT_CORE`; the test harness sets `ulimit -c 0` for its own runs. A policy
+- No `SECCOMP_FILTER_FLAG_TSYNC`. Irrelevant to `-a`, which installs before
+  any thread exists. Essential the moment this is used as a library.
+- A killed process dumps core by default. seccompc does not change
+  `RLIMIT_CORE`. The test harness sets `ulimit -c 0` for its own runs. A policy
   with `default=kill` applied to something that misbehaves in a loop will fill
   whatever your `core_pattern` points at.
-- **This is not a sandbox on its own.** seccomp gates syscalls, not paths: a
+- This is not a sandbox on its own. seccomp gates syscalls, not paths: a
   process permitted `openat` can open anything the filesystem permissions
-  allow. The sibling repo `jail` is the filesystem half, and the two compose
-  rather than substitute.
+  allow. The sibling repo `jail` is the filesystem half, and the two
+  compose, not substitute.
 
 ## Design
 
@@ -523,9 +521,9 @@ parse policy  ->  check each action against the kernel  ->  require execve
 
 Five decisions worth naming.
 
-**The arch check first.** Covered above; it is the reason the program exists.
+The arch check first. Covered above. It is the reason the program exists.
 
-**`no_new_privs` before the filter.** Not an ordering preference --
+`no_new_privs` before the filter. Not an ordering preference:
 `SECCOMP_SET_MODE_FILTER` returns `EACCES` without it unless you hold
 `CAP_SYS_ADMIN`, which is what we are avoiding. The reason the kernel insists:
 a filtered process that could exec a setuid-root binary would be handed
@@ -534,27 +532,27 @@ privileged program would meet `EPERM` on a syscall it has always been able to
 make. Seccomp's claim is that an unprivileged process may safely restrict
 itself, and that only holds if it cannot gain privileges afterwards.
 
-**Two instructions per rule, every jump offset 0 or 1.** The denser form -- one
-comparison per rule jumping forward to a shared return -- needs a check that
+Two instructions per rule, every jump offset 0 or 1. The denser form: one
+comparison per rule jumping forward to a shared return, needs a check that
 the 8-bit jump offsets still reach. This layout cannot overflow a jump by
 construction, and `2N+7 <= BPF_MAXINSNS` allows 2044 rules against the ~360
 syscalls that exist, so the denser encoding could never repay the arithmetic.
 
-**Actions are checked against the kernel and refused if missing.** The kernel
+Actions are checked against the kernel and refused if missing. The kernel
 does not reject a filter returning an action it does not know; it treats the
 value as the lowest action it recognises, `KILL_THREAD`. So a policy saying
 `kill_process` on a 4.13 kernel installs fine and does something else. This is
 Landlock's problem inverted: Landlock refuses an unknown access bit so you
 cannot be fooled, seccomp accepts an unknown return so you can.
 
-**`exec`, not `fork` + `wait`.** The command replaces seccompc in the same
+`exec`, not `fork` + `wait`. The command replaces seccompc in the same
 process, so there is no status to forward, no signal to re-raise and no pipe to
-pump. Transparency is a property of the design rather than code that implements
-it. It is also safe for the caller's shell: seccompc is already a child, the
+pump. Transparency is a property of the design. No code here
+implements it. It is also safe for the caller's shell: seccompc is already a child, the
 filter goes on seccompc's own task, and nothing is ever installed on a process
 that did not ask for it.
 
-**The file format is the in-memory form**, a bare array of `struct sock_filter`
+The file format is the in-memory form, a bare array of `struct sock_filter`
 in native byte order with no header and no magic, so there is no transformation
 between what `-c` writes and what `-a` installs that could differ.
 
