@@ -76,7 +76,7 @@ command that ran.
 
 ## Oracle
 
-The kernel is the authority. Ranked by how little we control it, which is also
+The kernel is the authority. Ranked by how little we control it, and that is also
 the order of what each would cost us to get wrong.
 
 1. The 32-bit entry point, driven for real. `t/try32` is built from the same
@@ -145,7 +145,7 @@ never dressed up as a pass.
   the filter and can be changed after the check. Offering `arg0==N` would
   invite exactly that race, so the answer is no.
 - `SECCOMP_RET_USER_NOTIF` and `SECCOMP_RET_TRACE`. Both need a supervisor
-  process, which is a different program.
+  process, a different program.
 - libseccomp, or any dependency. Emitting the BPF is the project.
 - Any architecture other than x86-64. The arch check is a single constant on
   purpose. A multi-arch filter is a different and much larger shape.
@@ -240,7 +240,7 @@ Granularity is for `git bisect` and `git revert`, so every commit builds.
       fix is a trampoline: install a filter that permits exec only from a
       specific `instruction_pointer`, or use `SECCOMP_RET_TRACE` with a
       supervisor that allows exactly one. Both are much larger than this
-      program, which is why the current behaviour is a documented
+      program, so the current behaviour is a documented
       refusal, not a silent implicit allow.
 - [ ] Group rules by action: one `jeq` per rule jumping to a shared return.
       why: halves the program, and the only reason not to is that it needs a
