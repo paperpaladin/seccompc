@@ -209,7 +209,7 @@ Granularity is for `git bisect` and `git revert`, so every commit builds.
 
 ### Milestone 1: the gaps the current suite cannot close
 
-- [ ] A probe mode that loads a filter file in a forked child and reports the
+- [x] A probe mode that loads a filter file in a forked child and reports the
       kernel's errno, so `-d`'s validator can be asserted to agree with
       `bpf_check_classic()`.
       why: the validator is the one part of this repo with no external

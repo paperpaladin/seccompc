@@ -29,7 +29,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/prctl.h>
+#include <sys/wait.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -112,6 +114,7 @@ static void usage(FILE *f) {
 	    "usage: %s -a POLICY -- CMD [ARGS...]   install filter, exec CMD\n"
 	    "       %s -c POLICY -o FILE            compile policy to FILE\n"
 	    "       %s -d FILE                      disassemble FILE\n"
+	    "       %s --probe FILE                 ask the kernel to load FILE\n"
 	    "       %s --actions                    actions this kernel offers\n"
 	    "\n"
 	    "POLICY is ';'-separated clauses:\n"
@@ -132,7 +135,7 @@ static void usage(FILE *f) {
 	    "env SECCOMPC_NO_ACTION=NAME pretends the kernel lacks that action\n"
 	    "(downward only), so the refusal path can be driven on a kernel that\n"
 	    "has everything.\n",
-	    prog, prog, prog, prog, prog);
+	    prog, prog, prog, prog, prog, prog);
 }
 
 /*
@@ -963,6 +966,118 @@ static void install(struct sock_filter *f, int n) {
 		die("prctl(PR_SET_SECCOMP): %s", strerror(errno));
 }
 
+/* ------------------------------------------------------------- probe ----- */
+/*
+ * Hand a filter to the kernel and report what it said.
+ *
+ * The validator in disasm() is the one part of this program with no
+ * outside authority. Everything else is checked against the kernel by
+ * being run; the validator is checked against nothing, because the
+ * only filters it ever sees are ones this program emitted. A filter we
+ * accept and the kernel refuses turns up indirectly as a failed
+ * install, and a filter we REFUSE that the kernel would have accepted
+ * is invisible entirely.
+ *
+ * So: load it in a forked child and report the errno. The fork is not
+ * tidiness, and neither is the pipe.
+ *
+ * The first version carried the answer out in the child's exit status,
+ * and two of the five filters this program emits killed it. A filter
+ * whose default action is kill denies exit_group, so a child that
+ * installs it successfully is killed by SIGSYS at the moment it tries
+ * to say so. The channel cannot be a syscall the filter might forbid.
+ *
+ * The pipe is written BEFORE the filter exists, which is the only
+ * moment every syscall is certainly available. After that:
+ *
+ *   the pipe carries an errno   the kernel refused it, and the write
+ *                               worked because no filter was installed
+ *   the pipe carries nothing    the kernel accepted it, and the child
+ *                               either exited or was killed by its own
+ *                               filter on the way out
+ *
+ * A SIGSYS death after the seccomp call is therefore evidence of
+ * success, not of failure, which reads backwards until you notice that
+ * a filter has to exist before it can kill anything.
+ *
+ * Exit codes, chosen so a shell can read them:
+ *   0  the kernel accepted the filter
+ *   1  the kernel refused it, with the errno named on stderr
+ *   2  this program could not run the probe at all
+ */
+static int probe(const char *path) {
+	struct sock_filter *f;
+	int n, st, fd[2];
+	pid_t pid;
+	int err = 0;
+	ssize_t got;
+
+	f = read_filter(path, &n);
+	if (n < 0 || n > 65535) {
+		fprintf(stderr, "%s: %d instructions, which cannot be put in a "
+		        "sock_fprog, so the kernel was not asked\n", path, n);
+		free(f);
+		return 2;
+	}
+	if (pipe(fd) < 0) { perror("pipe"); free(f); return 2; }
+
+	fflush(NULL);
+	pid = fork();
+	if (pid < 0) {
+		perror("fork");
+		close(fd[0]); close(fd[1]); free(f);
+		return 2;
+	}
+	if (pid == 0) {
+		struct sock_fprog prog;
+		int e;
+		close(fd[0]);
+		prog.len = (unsigned short)n;
+		prog.filter = f;
+		/* no_new_privs first, or seccomp() returns EACCES and the
+		 * answer is about privilege rather than about the filter. */
+		if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
+			e = -1;
+			(void)!write(fd[1], &e, sizeof e);
+			_exit(0);
+		}
+		if (syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, 0, &prog) == 0)
+			_exit(0);       /* may be killed by the filter; see above */
+		e = errno;
+		(void)!write(fd[1], &e, sizeof e);
+		_exit(0);
+	}
+
+	close(fd[1]);
+	free(f);
+	got = read(fd[0], &err, sizeof err);
+	close(fd[0]);
+	if (waitpid(pid, &st, 0) < 0) { perror("waitpid"); return 2; }
+
+	if (got == (ssize_t)sizeof err) {
+		if (err == -1) {
+			fprintf(stderr, "%s: PR_SET_NO_NEW_PRIVS failed, so the "
+			        "kernel was never asked about the filter\n", path);
+			return 2;
+		}
+		printf("refused %s\n", strerror(err));
+		return 1;
+	}
+	if (got != 0) {
+		fprintf(stderr, "%s: short read from the probe, %zd bytes\n",
+		        path, got);
+		return 2;
+	}
+	if (WIFEXITED(st) || (WIFSIGNALED(st) && WTERMSIG(st) == SIGSYS)) {
+		printf("accepted\n");
+		return 0;
+	}
+	fprintf(stderr, "%s: the probe died of signal %d and said nothing, so "
+	        "the kernel's answer is unknown\n", path,
+	        WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+	return 2;
+}
+
 int main(int argc, char **argv) {
 	if (argv[0]) prog = argv[0];
 
@@ -971,6 +1086,7 @@ int main(int argc, char **argv) {
 		return 0;
 	}
 	if (argc == 2 && !strcmp(argv[1], "--actions")) return print_actions();
+	if (argc == 3 && !strcmp(argv[1], "--probe")) return probe(argv[2]);
 
 	if (argc >= 2 && !strcmp(argv[1], "-c")) {
 		struct sock_filter *f;
@@ -1019,6 +1135,13 @@ int main(int argc, char **argv) {
 		if (argc != 3) die("usage: %s -d FILE", prog);
 		f = read_filter(argv[2], &n);
 		bad = disasm(f, n);
+		/* An escape hatch for one test and nothing else: it makes
+		 * the validator accept everything, so the sweep that
+		 * compares it against the kernel can be shown to notice a
+		 * validator that is wrong. Without it that sweep agrees
+		 * perfectly and there is no way to tell whether it is
+		 * comparing anything. */
+		if (getenv("SECCOMPC_PROBE_LIE")) bad = 0;
 		free(f);
 		if (bad)
 			die("%s: %d problem%s; this is not a filter the kernel "

@@ -73,7 +73,7 @@ if [ -z "$avail" ]; then
 	         transparency malformed-refused; do
 		skipt "$n" "no seccomp filtering"
 	done
-	printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"
+printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"
 	exit 0
 fi
 # Which actions THIS kernel has. The suite skips loudly when seccomp is
@@ -652,6 +652,130 @@ case " $_o " in
 *" trap "*) bad '--actions honours the clamp' "trap still listed: $_o" ;;
 *)          ok '--actions honours the clamp' ;;
 esac
+
+# --- the validator, against the kernel -----------------------------------
+#
+# disasm()'s validator is the one part of this program with no outside
+# authority. Everything else is checked by being run; the validator is
+# checked against nothing, because the only filters it ever sees are
+# ones this program emitted. A filter we accept and the kernel refuses
+# shows up only indirectly as a failed install, and a filter we REFUSE
+# that the kernel would have accepted is invisible entirely.
+#
+# --probe asks the kernel. The two must agree on every filter below,
+# and the corpus is built to contain both verdicts, because a corpus
+# where everything is valid would agree perfectly while saying nothing
+# about the refusal half.
+VD=$TD/validator
+mkdir -p $VD
+
+# Filters we emit. These must be accepted by both.
+i=0
+for pol in \
+	'default=kill; allow=write,exit_group' \
+	'default=allow; kill=ptrace' \
+	'default=errno:ENOSYS; allow=read,write,exit_group,execve' \
+	'default=kill_thread; trap=kill; log=getpid' \
+	'default=kill; allow=0,1,2,3,4,5,6,7,8,9,10'; do
+	i=$((i + 1))
+	"$SC" -c "$pol" -o $VD/good$i.bin >/dev/null 2>&1 ||
+		bad "could not compile policy $i for the validator sweep"
+done
+
+# Filters that are wrong in ways the kernel has opinions about. Built
+# by hand, because nothing this program emits is malformed.
+# A lone RET is a complete, valid filter.
+printf '\006\000\000\000\000\000\377\177' > $VD/bad1.bin
+# A jump past the end.
+printf '\005\000\000\000\377\377\000\000\006\000\000\000\000\000\377\177' > $VD/bad2.bin
+# An opcode that is not a BPF instruction at all.
+printf '\377\377\000\000\000\000\000\000\006\000\000\000\000\000\377\177' > $VD/bad3.bin
+# A filter whose last instruction is not a return, so control falls off
+# the end.
+printf '\040\000\000\000\000\000\000\000' > $VD/bad4.bin
+# Empty.
+: > $VD/bad5.bin
+# A load from an offset outside struct seccomp_data.
+printf '\040\000\000\000\377\000\000\000\006\000\000\000\000\000\377\177' > $VD/bad6.bin
+
+agree=0; disagree=0; accepted=0; refused=0; unanswered=0
+for f in $VD/*.bin; do
+	"$SC" -d "$f" >/dev/null 2>&1
+	ours=$?
+	"$SC" --probe "$f" >/dev/null 2>&1
+	theirs=$?
+	if [ "$theirs" -eq 2 ]; then
+		unanswered=$((unanswered + 1))
+		skipt "the kernel could not be asked about $(basename $f)" \
+		      "the probe itself failed"
+		continue
+	fi
+	# 0 from -d means valid; anything else means we refused it.
+	o=refused; [ "$ours" -eq 0 ] && o=accepted
+	t=refused; [ "$theirs" -eq 0 ] && t=accepted
+	[ "$t" = accepted ] && accepted=$((accepted + 1)) || refused=$((refused + 1))
+	if [ "$o" = "$t" ]; then
+		agree=$((agree + 1))
+	else
+		disagree=$((disagree + 1))
+		bad "validator and kernel disagree on $(basename $f)" \
+		    "we $o it, the kernel $t it"
+	fi
+done
+
+# A sweep where everything was valid would agree perfectly and prove
+# nothing about the refusal half, and one where everything was invalid
+# would prove nothing about the other. Both counts are asserted.
+if [ "$accepted" -lt 3 ]; then
+	bad "the corpus contains filters the kernel accepts" \
+	    "only $accepted of $((accepted + refused)) were accepted"
+elif [ "$refused" -lt 3 ]; then
+	bad "the corpus contains filters the kernel refuses" \
+	    "only $refused of $((accepted + refused)) were refused"
+else
+	ok "the corpus has both verdicts in it: $accepted accepted, $refused refused"
+fi
+
+if [ "$disagree" -eq 0 ]; then
+	ok "the validator agrees with the kernel on all $agree filters"
+fi
+
+# Every filter must get an answer. Two of the five this program emits
+# have a default of kill, so a probe that reported through its exit
+# status was killed by SIGSYS on the way out and could say nothing:
+# both were skipped, the sweep still said "agrees on all", and the
+# number it agreed on was quietly smaller. A skip is not a pass and
+# must not be able to hide inside one.
+if [ "$unanswered" -eq 0 ]; then
+	ok "every filter in the corpus got an answer from the kernel"
+else
+	bad "every filter in the corpus got an answer from the kernel" \
+	    "$unanswered of $((agree + disagree + unanswered)) went unanswered"
+fi
+
+# And the comparison must be able to fail, which needs a validator
+# that is wrong. SECCOMPC_PROBE_LIE makes -d accept everything; if the
+# sweep above still reported agreement with that set, it would be
+# comparing nothing.
+if SECCOMPC_PROBE_LIE=1 "$SC" -d $VD/bad2.bin >/dev/null 2>&1; then
+	ok "a validator that accepts everything is available to test against"
+	liedis=0
+	for f in $VD/bad1.bin $VD/bad2.bin $VD/bad3.bin; do
+		SECCOMPC_PROBE_LIE=1 "$SC" -d "$f" >/dev/null 2>&1; o=$?
+		"$SC" --probe "$f" >/dev/null 2>&1; t=$?
+		[ "$t" -eq 2 ] && continue
+		[ "$o" -eq 0 ] && [ "$t" -ne 0 ] && liedis=$((liedis + 1))
+	done
+	if [ "$liedis" -gt 0 ]; then
+		ok "and the comparison catches it: $liedis disagreements"
+	else
+		bad "the comparison catches a validator that accepts everything" \
+		    "it reported none, so the sweep is not comparing the two"
+	fi
+else
+	bad "SECCOMPC_PROBE_LIE makes the validator accept a bad filter" \
+	    "it refused it anyway, so the escape hatch does not work"
+fi
 
 printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"
 [ "$fail" -eq 0 ]
