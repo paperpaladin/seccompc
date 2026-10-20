@@ -218,7 +218,7 @@ Ranked by how little we control them:
     ok    strace sees the errno change to ENOSYS
     ok    strace sees PR_SET_NO_NEW_PRIVS first
     ok    strace sees SECCOMP_SET_MODE_FILTER
-    ok    strace counted 108 syscalls under the filter
+    ok    strace counted 105 syscalls under the filter
     ok    kernel and -d agree the filter is 9 instructions
     ok    forked child is still filtered
     ok    forked child keeps what is allowed
@@ -331,6 +331,12 @@ Ranked by how little we control them:
 
     140 passed, 0 failed, 2 skipped
 ```
+
+One line in that transcript cannot be quoted exactly and is the only one that
+will not reproduce: `strace counted N syscalls under the filter` prints what
+strace saw, which moves between runs with how glibc's startup behaves. The
+assertion is that it exceeds ten, because a filter denying everything would
+satisfy every denial above for free.
 
 The escape transcript is the interesting one. Clearing `no_new_privs` is
 `EINVAL`. It is one-way. `PR_SET_SECCOMP` with `SECCOMP_MODE_DISABLED` is
